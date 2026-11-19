@@ -1,0 +1,39 @@
+captured: 2026-11-18T14:26:07+09:00
+source:   Ubuntu 26.04.1 LTS / example-host
+user:     example-user  home=/home/example-user  shell=/usr/bin/zsh
+ssh port: 2022
+apt manual packages: 76
+dotfiles: 10   system files: 1
+git repos: 3   external binaries: 4
+
+Captured:
+  + .zshrc
+  + .p10k.zsh
+  + .profile
+  + .bashrc
+  + .config/mise/config.toml
+  + .config/opencode/cli.json
+  + .config/opencode/tui.jsonc
+  + .config/herdr/config.toml
+  + .config/herdr/.plugins.lock
+  + .ssh/config
+  + /etc/fail2ban/jail.local
+  + .ssh/authorized_keys (public keys only)
+  + ssh/sshd_hardening.conf (generated)
+
+Skipped (secrets / noise / unreadable):
+
+
+Git repos to re-clone on target:
+  * ~/.config/dots  <- git@github.com:OWNER/REPO.git
+  * ~/.oh-my-zsh  <- https://github.com/ohmyzsh/ohmyzsh.git
+  * ~/.oh-my-zsh/custom/themes/powerlevel10k  <- https://github.com/romkatv/powerlevel10k.git
+
+External binaries (NOT copied - fill in [[binaries]].install):
+  * ~/.local/bin/herdr  (~25.0 MiB)
+  * ~/.local/bin/herdr-core  (~7.3 MiB)
+  * ~/.opencode/bin/opencode  (~191.6 MiB)
+  * ~/.opencode/bin/opencode2  (~0.0 MiB)
+
+Never captured: private ssh keys, service.json, tokens, history,
+zcompdump, caches, logs. Add patterns to denylist.txt.
