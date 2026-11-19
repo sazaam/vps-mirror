@@ -22,12 +22,16 @@ class ActionTests(unittest.TestCase):
     def test_default_actions_are_declared(self):
         actions = vpsclone.default_action_defs()
         ids = [a["id"] for a in actions]
-        self.assertEqual(ids, ["provider_snapshot", "github_deploy_key",
-                               "data_paths", "vault_unpack", "save_session"])
+        self.assertEqual(ids, [
+            "provider_snapshot", "github_deploy_key", "data_paths",
+            "allow_symlinks", "github_key_check", "ssh_prepare", "fresh_login",
+            "ssh_commit", "data_destination", "data_sync_dry", "data_sync_live",
+            "vault_unpack", "save_session",
+        ])
         for a in actions:
             self.assertIn(a["kind"],
-                          {"acknowledge", "prompt_value", "guided_subprocess",
-                           "save_session"})
+                          {"acknowledge", "prompt_value", "prompt_bool",
+                           "guided_subprocess", "save_session"})
 
     def test_set_manifest_value_splits_data_paths(self):
         m = {"data": {"paths": []}}
@@ -36,6 +40,12 @@ class ActionTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(m["data"]["paths"],
                          ["/home/saz/data", "/srv/backup", "/var/lib/x"])
+
+    def test_set_manifest_value_stores_boolean(self):
+        m = {"policy": {"allow_symlinks": False}}
+        ok = vpsclone._set_manifest_value(m, "policy.allow_symlinks", True)
+        self.assertTrue(ok)
+        self.assertIs(m["policy"]["allow_symlinks"], True)
 
     def test_set_manifest_value_rejects_bad_target(self):
         m = {"data": {"paths": []}}
@@ -108,6 +118,53 @@ class ActionTests(unittest.TestCase):
                 self.assertIn("refused", note)
             finally:
                 vpsclone.MANIFEST = original
+
+    def test_new_guided_command_ids_are_fixed(self):
+        self.assertEqual(
+            vpsclone._action_argv({"command_id": "github_ssh"})[-1],
+            "git@github.com",
+        )
+        m = {"data": {"destination": "saz@new-vps:/srv/data",
+                      "paths": ["~/Music", "/srv/notes"]}}
+        argv = vpsclone._action_argv({"command_id": "sync_data",
+                                      "dry_run": True}, m)
+        self.assertEqual(argv[-2:],
+                         ["--destination", "saz@new-vps:/srv/data"])
+        self.assertIn("--path", argv)
+        self.assertIn("~/Music", argv)
+        self.assertIn("--dry-run",
+                      vpsclone._action_argv({"command_id": "sync_data",
+                                             "dry_run": True}, m))
+        self.assertIsNone(
+            vpsclone._action_argv({"command_id": "sync_data"},
+                                  {"data": {"destination": "rm -rf /"}}))
+
+    def test_ssh_cutover_command_ids_are_fixed(self):
+        self.assertEqual(
+            vpsclone._action_argv({"command_id": "ssh_cutover_prepare",
+                                   "rollback_seconds": 600})[-2:],
+            ["--rollback-seconds", "600"],
+        )
+        self.assertEqual(
+            vpsclone._action_argv({"command_id": "ssh_cutover_commit"})[-2:],
+            ["ssh-cutover-commit", "--confirm-login"],
+        )
+        self.assertEqual(
+            vpsclone._action_argv({"command_id": "ssh_cutover_rollback"})[-1],
+            "ssh-cutover-rollback",
+        )
+
+    def test_user_key_actions_for_target_added_users(self):
+        m = {"users": [
+            {"name": "alice", "home": "/home/alice", "authorized_keys": "",
+             "authorized_keys_inline": ""},
+            {"name": "bob", "home": "/home/bob", "authorized_keys": "ssh/bob.pub",
+             "authorized_keys_inline": ""},
+        ]}
+        actions = vpsclone.user_key_actions(m)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["id"], "user_key_0_alice")
+        self.assertEqual(actions[0]["target"], "users.0.authorized_keys_inline")
 
 
 if __name__ == "__main__":

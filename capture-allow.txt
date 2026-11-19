@@ -1,0 +1,5 @@
+# Override content-scan quarantines for known-safe files.
+# One entry per line:
+#   .config/opencode/cli.json
+#   sha256:abcdef1234567890
+# Lines starting with '#' are ignored. Empty file = no overrides.

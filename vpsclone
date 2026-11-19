@@ -42,6 +42,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -52,10 +53,11 @@ except ImportError:
 REPO = Path(__file__).resolve().parent
 MANIFEST = REPO / "manifest.toml"
 DENYLIST = REPO / "denylist.txt"
+CAPTURE_ALLOW = REPO / "capture-allow.txt"
 REPORTS = REPO / "reports"
 BACKUP_ROOT = Path("/var/backups/vpsclone")
 
-DOTFILE_ALLOW = [
+BASE_DOTFILES = [
     ".zshrc", ".p10k.zsh", ".profile", ".bashrc", ".gitconfig", ".vimrc",
     ".config/mise/config.toml",
     ".config/opencode/cli.json",
@@ -64,7 +66,57 @@ DOTFILE_ALLOW = [
     ".config/herdr/.plugins.lock",
     ".ssh/config",
 ]
+
+# Common, low-risk dotfiles we look for automatically. Secret-shaped files
+# (.npmrc, .pypirc, .netrc, cloud/CLI credentials, private keys) are deliberately
+# NOT here; the denylist and content scan still gate every entry below.
+COMMON_DOTFILES = [
+    # shells, terminals, login
+    ".inputrc", ".editrc", ".tmux.conf", ".screenrc", ".Xresources",
+    ".xinitrc", ".curlrc", ".wgetrc",
+    ".config/fish/config.fish",
+    ".config/starship.toml",
+    ".config/alacritty/alacritty.toml",
+    ".config/kitty/kitty.conf",
+    ".config/wezterm/wezterm.lua",
+    ".config/foot/foot.ini",
+    ".config/zellij/config.kdl",
+    # editors / git / diff
+    ".editorconfig", ".gitattributes", ".gitmsg",
+    ".config/git/config", ".config/git/ignore", ".config/git/attributes",
+    ".config/nvim/init.lua", ".config/nvim/init.vim",
+    ".config/helix/config.toml",
+    ".config/lazygit/config.yml",
+    ".config/lsd/config.yaml",
+    ".config/bat/config",
+    ".config/ripgrep/config",
+    ".config/fd/ignore",
+    # dev tooling
+    ".config/direnv/direnvrc",
+    ".config/mise/settings.toml",
+    ".config/pip/pip.conf",
+    ".config/cargo/config.toml",
+    ".config/gemrc",
+    ".config/htop/htoprc",
+    # desktop / XDG housekeeping
+    ".config/mimeapps.list",
+    ".config/user-dirs.dirs",
+]
+
+DOTFILE_ALLOW = list(dict.fromkeys(BASE_DOTFILES + COMMON_DOTFILES))
 SYSTEM_ALLOW = ["/etc/fail2ban/jail.local"]
+
+# Shared by capture quarantine and save_session persistence checks.
+SECRET_PATTERNS = [
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"(?i)(authorization\s*:|token\s*=|password\s*=|passwd\s*=)"),
+    re.compile(r"https://[^/\s:@]+:[^/\s@]+@"),
+    re.compile(r"(?i)private[_-]?key"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+]
 
 BUILTIN_DENY = [
     "*service.json", "*credentials*", "*.netrc", "*.pem", "*.key",
@@ -610,7 +662,8 @@ def inv_cargo(home: str, runner=cmd):
             m = _CARGO_LIST_RE.match(line.strip())
             if m:
                 records.append({"installer": "cargo", "name": m.group(1),
-                                "version": m.group(2), "replayable": True})
+                                "version": re.sub(r"^v", "", m.group(2)),
+                                "replayable": True})
         notes.append("cargo names from `cargo install --list`")
     else:
         bindir = Path(home) / ".cargo/bin"
@@ -665,6 +718,8 @@ def inventory_packages(home: str, runner=cmd,
                   if r["installer"] == "cargo" and r.get("replayable", True)],
         "mise": {"tools": [r["name"] for r in records
                            if r["installer"] == "mise"]},
+        # Full records keep versions for convergence checks and pinned replay.
+        "records": [dict(r) for r in records],
     }
 
     canonical = "\n".join(json.dumps(r, sort_keys=True, separators=(",", ":"))
@@ -677,6 +732,245 @@ def inventory_packages(home: str, runner=cmd,
         "records_sha256": sha256_bytes(canonical.encode()),
     }
     return packages, meta
+
+
+# ------------------------------------------------------- convergence checks
+def _pkg_installed(pkg: str, runner=cmd) -> bool:
+    rc, out = runner(["dpkg-query", "-W", "-f=${Status}", pkg], quiet=True)
+    return rc == 0 and "install ok installed" in out
+
+
+def expected_versions(m: dict, installer: str) -> dict[str, str]:
+    """Name -> version from full records, with a legacy name-only fallback."""
+    out: dict[str, str] = {}
+    for r in m.get("packages", {}).get("records", []) or []:
+        if r.get("installer") != installer:
+            continue
+        if installer == "cargo" and r.get("replayable", True) is False:
+            continue
+        name = str(r.get("name", ""))
+        if name:
+            out[name] = str(r.get("version", ""))
+    if out:
+        return out
+    for name in m.get("packages", {}).get(installer, []) or []:
+        n = str(name)
+        if n:
+            out[n] = ""
+    return out
+
+
+def npm_global_versions(home: str, runner=cmd) -> dict[str, str]:
+    rc, out = runner(["npm", "ls", "-g", "--json", "--depth=0"],
+                     quiet=True, env={"HOME": home})
+    if rc:
+        return {}
+    try:
+        deps = (json.loads(out) or {}).get("dependencies") or {}
+    except ValueError:
+        return {}
+    return {
+        str(name): str(info.get("version", "")) if isinstance(info, dict) else ""
+        for name, info in deps.items() if str(name)
+    }
+
+
+def pipx_global_versions(home: str, runner=cmd) -> dict[str, str]:
+    rc, out = runner(["pipx", "list", "--short"], quiet=True,
+                     env={"HOME": home})
+    if rc:
+        return {}
+    out_map = {}
+    for line in out.splitlines():
+        s = line.strip()
+        if not s or s.startswith("-"):
+            continue
+        parts = s.rsplit(" ", 1)
+        if len(parts) == 2 and _PIPX_VERSION_RE.fullmatch(parts[1]):
+            out_map[parts[0]] = parts[1]
+        else:
+            out_map[s] = ""
+    return out_map
+
+
+def cargo_global_versions(home: str, runner=cmd) -> dict[str, str]:
+    rc, out = runner(["cargo", "install", "--list"], quiet=True,
+                     env={"HOME": home})
+    if rc:
+        return {}
+    out_map = {}
+    for line in out.splitlines():
+        m2 = _CARGO_LIST_RE.match(line.strip())
+        if m2:
+            out_map[m2.group(1)] = re.sub(r"^v", "", m2.group(2))
+    return out_map
+
+
+def git_repo_state(path: Path, runner=cmd) -> dict:
+    def out_of(*args: str) -> str:
+        rc, out = runner(["git", "-C", str(path), *args], quiet=True)
+        return out.strip() if rc == 0 else ""
+
+    dirty = out_of("status", "--porcelain")
+    return {
+        "exists": path.exists(),
+        "url": redact_url(out_of("remote", "get-url", "origin")),
+        "branch": out_of("branch", "--show-current"),
+        "commit": out_of("rev-parse", "HEAD"),
+        "dirty": bool(dirty),
+    }
+
+
+def service_state(name: str, runner=cmd) -> dict:
+    rc_a, active = runner(["systemctl", "is-active", name], quiet=True)
+    rc_e, _ = runner(["systemctl", "is-enabled", name], quiet=True)
+    return {"active": rc_a == 0 and active.strip() == "active",
+            "enabled": rc_e == 0}
+
+
+def check_convergence(m: dict, dry: bool = False, runner=cmd
+                      ) -> list[tuple[str, bool, str, bool]]:
+    """Compare target state with the effective manifest.
+
+    Returns (name, ok, detail, warn). Manual gates are WARN, never PASS.
+    """
+    out: list[tuple[str, bool, str, bool]] = []
+
+    def ck(name: str, ok: bool, detail="", warn=False) -> None:
+        out.append((name, bool(ok), str(detail), bool(warn)))
+
+    home = m["target"]["home"]
+    diff = "would differ" if dry else "differs"
+
+    missing_apt = [p for p in m.get("packages", {}).get("apt", [])
+                   if not _pkg_installed(p, runner)]
+    ck("apt:packages", not missing_apt,
+       f"missing: {', '.join(missing_apt)}" if missing_apt else "all present")
+
+    for installer, label, reader in (
+        ("npm", "npm:versions", npm_global_versions),
+        ("pipx", "pipx:versions", pipx_global_versions),
+        ("cargo", "cargo:versions", cargo_global_versions),
+    ):
+        want = expected_versions(m, installer)
+        if not want:
+            continue
+        got = reader(home, runner=runner)
+        missing = [n for n in want if n not in got]
+        mismatch = [f"{n}: want {v}, got {got[n]}" for n, v in want.items()
+                    if n in got and v and got[n] and got[n] != v]
+        unpinned = [n for n, v in want.items()
+                    if n in got and not v]
+        if missing or mismatch:
+            ck(label, False,
+               f"{diff}; missing={','.join(missing) or '-'}; "
+               f"mismatch={'; '.join(mismatch) or '-'}")
+        elif unpinned:
+            ck(label, False, f"unpinned: {', '.join(unpinned)}", warn=True)
+        else:
+            ck(label, True, f"{len(want)} version(s) match")
+
+    want_mise = m.get("packages", {}).get("mise", {}).get("tools", []) or []
+    if want_mise:
+        got_mise = mise_tools(home)
+        ck("mise:tools", sorted(want_mise) == sorted(got_mise),
+           f"want={','.join(want_mise)} got={','.join(got_mise)}")
+
+    for u in effective_users(m):
+        ck(f"user:{u['name']}", user_exists(u["name"]), u["name"])
+        inline = str(u.get("authorized_keys_inline", "") or "").strip()
+        ak = u.get("authorized_keys", "")
+        dst = Path(u["home"]) / ".ssh/authorized_keys"
+        if inline:
+            want = (inline.rstrip("\n") + "\n").encode()
+            ck(f"key:{u['name']}", dst.is_file() and dst.read_bytes() == want)
+        elif ak:
+            src = REPO / ak
+            ck(f"key:{u['name']}",
+               src.is_file() and dst.is_file() and src.read_bytes() == dst.read_bytes())
+
+    for s in m.get("services", {}).get("enable", []):
+        st = service_state(s, runner=runner)
+        ck(f"service:{s}", st["active"] and st["enabled"],
+           f"active={st['active']} enabled={st['enabled']}")
+
+    for target, src in m.get("system_files", {}).items():
+        s, d = REPO / src, Path(target)
+        ck(f"system:{target}",
+           s.is_file() and d.is_file() and s.read_bytes() == d.read_bytes())
+
+    allow_links = str(m.get("policy", {}).get("allow_symlinks", False)).lower() \
+        in {"1", "true", "yes", "y"}
+    links = (m.get("baseline", {}).get("dotfile_symlinks", {}) or {})
+    for target, src in m.get("dotfiles", {}).items():
+        s, d = REPO / src, expand(target, home)
+        link = links.get(target) if allow_links else None
+        if link:
+            want = safe_link_target(link, home)
+            ck(f"dotfile:{target}", d.is_symlink() and os.readlink(d) == want,
+               f"want link {want}")
+        else:
+            ck(f"dotfile:{target}",
+               s.is_file() and d.is_file() and s.read_bytes() == d.read_bytes())
+
+    for r in m.get("repos", []):
+        p = expand(r["path"], home)
+        st = git_repo_state(p, runner=runner)
+        if not st["commit"]:
+            ck(f"repo:{r['path']}", False, f"not a git checkout ({diff})")
+        elif r.get("url") and st["url"] and st["url"] != r["url"]:
+            ck(f"repo:{r['path']}", False,
+               f"url want={r['url']} got={st['url']}")
+        elif r.get("branch") and st["branch"] and st["branch"] != r["branch"]:
+            ck(f"repo:{r['path']}", False,
+               f"branch want={r['branch']} got={st['branch']}")
+        elif r.get("commit") and st["commit"] != r["commit"]:
+            ck(f"repo:{r['path']}", False,
+               f"commit want={r['commit']} got={st['commit']}")
+        elif st["dirty"]:
+            ck(f"repo:{r['path']}", False, "working tree has local changes", warn=True)
+        else:
+            ck(f"repo:{r['path']}", True, st["commit"][:8])
+
+    for b in m.get("binaries", []):
+        name = b.get("name", "?")
+        p = expand(b.get("path", ""), home)
+        want = str(b.get("sha256", ""))
+        if not want:
+            ck(f"binary:{name}", False, "no source hash - cannot verify", warn=True)
+        elif not p.is_file():
+            ck(f"binary:{name}", False, f"missing {p}")
+        else:
+            try:
+                got = sha256_file(p)
+            except OSError as exc:
+                ck(f"binary:{name}", False, str(exc))
+            else:
+                ck(f"binary:{name}", got == want,
+                   "hash matches" if got == want else f"want {want[:12]} got {got[:12]}")
+
+    rc, ss = runner(["ss", "-tulpn"], quiet=True)
+    port = str(m["ssh"]["port"])
+    ck("ssh:port", rc == 0 and (f":{port} " in ss or f":{port}\n" in ss),
+       f"port {port}")
+    ck("ssh:sshd_t", runner(["sshd", "-t"], quiet=True)[0] == 0)
+    dropin = FINAL_DROPIN if FINAL_DROPIN.is_file() else CUTOVER_DROPIN
+    body = dropin.read_text() if dropin.is_file() else ""
+    ck("ssh:key_only", "PasswordAuthentication no" in body
+       and "PubkeyAuthentication yes" in body)
+    expected = [u["name"] for u in effective_users(m) if u["ssh_allow"]]
+    allow_m = re.search(r"(?m)^AllowUsers\s+(.+)$", body)
+    allow = set(allow_m.group(1).split()) if allow_m else set()
+    missing = [u for u in expected if u not in allow]
+    ck("ssh:allow_users", not missing,
+       "missing: " + ",".join(missing) if missing else "all allowed")
+
+    ck("manual:login", False, "test a fresh SSH session from your local shell", warn=True)
+    ck("manual:github", False, "confirm the deploy key is accepted by GitHub", warn=True)
+    ck("manual:vault", False, "vault restore is out-of-band - verify yourself", warn=True)
+    ck("manual:data", False, "data sync is out-of-band - verify yourself", warn=True)
+
+    return out
 
 
 def find_git_repos(home: str, max_depth: int = 4) -> list[Path]:
@@ -712,10 +1006,12 @@ def detect_repos(home: str) -> list[dict]:
         if rc or not out.strip():
             continue
         rc2, br = cmd(["git", "-C", str(p), "branch", "--show-current"], quiet=True)
+        rc3, sha = cmd(["git", "-C", str(p), "rev-parse", "HEAD"], quiet=True)
         repos.append({
             "path": "~/" + str(p.relative_to(root)),
             "url": redact_url(out.strip()),
             "branch": br.strip() if rc2 == 0 and br.strip() else "main",
+            "commit": sha.strip() if rc3 == 0 else "",
         })
     return sorted(repos, key=lambda r: r["path"])
 
@@ -734,6 +1030,7 @@ def detect_binaries(home: str) -> list[dict]:
                 "name": p.name,
                 "path": "~/" + str(p.relative_to(root)),
                 "size_mb": round(p.stat().st_size / 1024 / 1024, 1),
+                "sha256": sha256_file(p),
                 "install": "",  # e.g. "curl -fsSL https://opencode.ai/install | bash"
             })
     return res
@@ -778,6 +1075,41 @@ def render_dropin(m: dict, source: str) -> str:
 
 
 # -------------------------------------------------------------- capture
+def symlink_link_target(src: Path, home: str) -> tuple[str | None, str | None]:
+    """Return a portable '~/...' link target, or a refusal reason.
+
+    Symlinks are only followed when their final target stays inside the source
+    home. That keeps dotS-style link farms working without pulling files from
+    /etc, /root or other users into the bundle.
+    """
+    try:
+        resolved = src.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "broken or looping symlink"
+    if not resolved.is_file():
+        return None, "symlink target is not a regular file"
+    root = Path(home).resolve()
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return None, "symlink target outside home"
+    if rel == Path("."):
+        return None, "symlink target is home directory"
+    return "~/" + str(rel), None
+
+
+def safe_link_target(link: str, home: str) -> str:
+    """Validate a recorded '~/...' link target before creating it on target."""
+    if not isinstance(link, str) or not link.startswith("~/") or "\n" in link:
+        die(f"refusing unsafe dotfile link target: {link!r}")
+    p = expand(link, home)
+    root = Path(home).resolve(strict=False)
+    resolved = p.resolve(strict=False)
+    if resolved == root or root not in resolved.parents:
+        die(f"refusing dotfile link outside target home: {link!r}")
+    return str(p)
+
+
 def clean_generated_dirs() -> None:
     """Remove stale generated artifacts so re-capture cannot bundle old secrets."""
     for base in (REPO / "dotfiles", REPO / "system", REPO / "ssh/users"):
@@ -808,6 +1140,69 @@ def safe_capture_source(src: Path, rel: str, pats: list[str]) -> str | None:
     if is_denied(rel, pats) or is_denied(str(src.resolve()), pats):
         return "denylist"
     return None
+
+
+def _capture_allow_entries() -> set[str]:
+    if not CAPTURE_ALLOW.exists():
+        return set()
+    return {
+        line.strip() for line in CAPTURE_ALLOW.read_text(errors="replace").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+
+def capture_allowed(src: Path, rel: str) -> bool:
+    entries = _capture_allow_entries()
+    if rel in entries:
+        return True
+    try:
+        digest = sha256_file(src)
+    except OSError:
+        return False
+    return any(e in entries for e in
+               (f"sha256:{digest}", f"sha256:{digest[:12]}"))
+
+
+def content_secret_hits(src: Path, rel: str) -> list[str]:
+    """Return matched secret-pattern labels for a candidate capture file."""
+    if capture_allowed(src, rel):
+        return []
+    try:
+        raw = src.read_bytes()
+    except OSError:
+        return []
+    if b"\x00" in raw[:4096]:
+        return []
+    text = raw.decode(errors="replace")
+    hits = []
+    for pattern in SECRET_PATTERNS:
+        if pattern.search(text) and pattern.pattern not in hits:
+            hits.append(pattern.pattern)
+    return hits
+
+
+def capture_copy(src: Path, rel: str, dst: Path, pats: list[str],
+                 copied: list, skipped: list, *, label: str = "") -> bool:
+    """Path-check, content-scan and copy one source file into the bundle."""
+    show = label or rel
+    why = safe_capture_source(src, rel, pats)
+    if why:
+        if why != "missing":
+            skipped.append((show, why))
+        return False
+    hits = content_secret_hits(src, rel)
+    if hits:
+        skipped.append((show, "content secret: " + ", ".join(hits[:3])))
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(src, dst)
+    except PermissionError:
+        skipped.append((show, "permission denied - rerun with sudo"))
+        return False
+    copied.append(show + (" (allowed by capture-allow.txt)"
+                          if capture_allowed(src, rel) else ""))
+    return True
 
 
 USER_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\$?$")
@@ -875,15 +1270,8 @@ def capture_user_spec(name: str, pats: list[str], copied: list,
     }
     ak = Path(pw.pw_dir) / ".ssh/authorized_keys"
     rel = f"ssh/users/{name}/authorized_keys"
-    why = safe_capture_source(ak, rel, pats)
-    if why is None:
-        dst = REPO / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ak, dst)
+    if capture_copy(ak, rel, REPO / rel, pats, copied, skipped):
         spec["authorized_keys"] = rel
-        copied.append(rel)
-    elif why != "missing":
-        skipped.append((rel, why))
     return spec
 
 
@@ -923,6 +1311,7 @@ def effective_users(m: dict) -> list[dict]:
         "sudo_group": t.get("sudo_group", ""),
         "authorized_keys": m.get("ssh", {}).get("authorized_keys_file",
                                                "ssh/authorized_keys"),
+        "authorized_keys_inline": "",
         "ssh_allow": True,
         "create_home": True,
     }]
@@ -952,6 +1341,7 @@ def effective_users(m: dict) -> list[dict]:
             "groups": groups,
             "sudo_group": str(u.get("sudo_group", "") or ""),
             "authorized_keys": ak or "",
+            "authorized_keys_inline": str(u.get("authorized_keys_inline", "") or ""),
             "ssh_allow": u.get("ssh_allow", True) is not False,
             "create_home": u.get("create_home", True) is not False,
         })
@@ -1049,51 +1439,40 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
             "pre_apply": "hooks/pre-apply.sh",
             "post_apply": "hooks/post-apply.sh",
         },
+        "dotfile_symlinks": {},
+        "policy": {"allow_symlinks": False},
     }
     if extra_users:
         data["users"] = extra_users
 
     for rel in DOTFILE_ALLOW:
         src = Path(home) / rel
-        why = safe_capture_source(src, rel, pats)
-        if why == "missing":
-            continue
-        if why:
-            skipped.append((rel, why))
-            continue
         dst = REPO / "dotfiles" / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        dfmap[f"~/{rel}"] = str(dst.relative_to(REPO))
-        copied.append(rel)
+        capture_src = src
+        link_target = None
+        st = lstat(src)
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            link_target, why = symlink_link_target(src, home)
+            if why:
+                skipped.append((rel, "symlink " + why))
+                continue
+            capture_src = src.resolve(strict=True)
+        label = f"{rel} -> {link_target}" if link_target else rel
+        if capture_copy(capture_src, rel, dst, pats, copied, skipped, label=label):
+            target = f"~/{rel}"
+            dfmap[target] = str(dst.relative_to(REPO))
+            if link_target:
+                data["dotfile_symlinks"][target] = link_target
 
     for abspath in SYSTEM_ALLOW:
         src = Path(abspath)
-        why = safe_capture_source(src, abspath, pats)
-        if why == "missing":
-            continue
-        if why:
-            skipped.append((abspath, why))
-            continue
         dst = REPO / "system" / str(src).lstrip("/")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.copy2(src, dst)
-        except PermissionError:
-            skipped.append((abspath, "permission denied - rerun with sudo"))
-            continue
-        sysmap[abspath] = str(dst.relative_to(REPO))
-        copied.append(abspath)
+        if capture_copy(src, abspath, dst, pats, copied, skipped):
+            sysmap[abspath] = str(dst.relative_to(REPO))
 
     ak = Path(home) / ".ssh/authorized_keys"
-    why = safe_capture_source(ak, ".ssh/authorized_keys", pats)
-    if why is None:
-        dst = REPO / "ssh/authorized_keys"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ak, dst)
-        copied.append(".ssh/authorized_keys (public keys only)")
-    elif why != "missing":
-        skipped.append((".ssh/authorized_keys", why))
+    capture_copy(ak, ".ssh/authorized_keys", REPO / "ssh/authorized_keys",
+                 pats, copied, skipped, label=".ssh/authorized_keys (public keys only)")
 
     dh = REPO / "ssh/sshd_hardening.conf"
     dh.parent.mkdir(parents=True, exist_ok=True)
@@ -1120,15 +1499,21 @@ def write_capture_report(data: dict, copied: list[str],
           for u in users],
         f"ssh port: {data['ssh']['port']}",
         f"apt manual packages: {len(data['packages']['apt'])}",
-        f"dotfiles: {len(data['dotfiles'])}   system files: {len(data['system_files'])}",
+        f"dotfiles: {len(data['dotfiles'])}   "
+        f"symlinks: {len(data.get('dotfile_symlinks', {}))}   "
+        f"system files: {len(data['system_files'])}",
         f"git repos: {len(data['repos'])}   external binaries: {len(data['binaries'])}",
         "",
-        "Captured:",
+        "Ship list (captured into bundle):",
         *[f"  + {c}" for c in copied],
         "",
-        "Skipped (secrets / noise / unreadable):",
-        *[f"  - {p}  [{why}]" for p, why in skipped],
+        "Quarantined by content scan:",
+        *([f"  ! {p}  [{why}]" for p, why in skipped
+           if why.startswith("content secret")] or ["  (none)"]),
         "",
+        "Skipped (denylist / noise / unreadable):",
+        *[f"  - {p}  [{why}]" for p, why in skipped
+          if not why.startswith("content secret")],
         "",
         "Git repos to re-clone on target:",
         *[f"  * {r['path']}  <- {r['url']}" for r in data["repos"]],
@@ -1136,8 +1521,9 @@ def write_capture_report(data: dict, copied: list[str],
         "External binaries (NOT copied - fill in [[binaries]].install):",
         *[f"  * {b['path']}  (~{b['size_mb']} MiB)" for b in data["binaries"]],
         "",
-        "Never captured: private ssh keys, service.json, tokens, history,",
-        "zcompdump, caches, logs. Add patterns to denylist.txt.",
+        "Content scan refuses token/password/private-key markers even in",
+        "allowlisted paths. To override a false positive, add the relative path",
+        "or sha256:<hash> to capture-allow.txt; add path patterns to denylist.txt.",
     ]
     atomic_write_text(REPORTS / "capture-report.txt", "\n".join(lines) + "\n")
 
@@ -1278,6 +1664,95 @@ def default_action_defs() -> list[dict]:
             "check_task": "data",
         },
         {
+            "id": "allow_symlinks",
+            "task": "dotfiles",
+            "kind": "prompt_bool",
+            "title": "Allow captured symlinks?",
+            "target": "policy.allow_symlinks",
+            "message": "Recreate captured dotfile symlinks on target",
+            "why": "Captured symlinks stay inside the source home and pass "
+                   "the content scan. Choose no to write plain files instead.",
+            "check_task": "dotfiles",
+        },
+        {
+            "id": "github_key_check",
+            "task": "deploy_key",
+            "kind": "guided_subprocess",
+            "command_id": "github_ssh",
+            "title": "Verify GitHub deploy key",
+            "confirm": "If GitHub greets you by name, press Enter to continue.",
+            "why": "Runs `ssh -T git@github.com` in a real terminal; no "
+                   "credentials are stored by the mirror.",
+            "check_task": "deploy_key",
+        },
+        {
+            "id": "ssh_prepare",
+            "task": "ssh",
+            "kind": "guided_subprocess",
+            "command_id": "ssh_cutover_prepare",
+            "rollback_seconds": 600,
+            "title": "Stage dual-port SSH cutover",
+            "confirm": "Both ports should now accept connections.",
+            "why": "Keeps the old port live while adding the new one.",
+            "check_task": "ssh",
+        },
+        {
+            "id": "fresh_login",
+            "task": "ssh",
+            "kind": "acknowledge",
+            "title": "Verify fresh SSH login",
+            "message": "From a NEW local terminal, ssh in on the target port "
+                       "and press Enter here only after it succeeds.",
+            "why": "Only a real external session can prove the SSH cutover "
+                   "did not lock you out.",
+            "check_task": "ssh",
+        },
+        {
+            "id": "ssh_commit",
+            "task": "ssh",
+            "kind": "guided_subprocess",
+            "command_id": "ssh_cutover_commit",
+            "title": "Commit SSH cutover",
+            "confirm": "Only continue after the fresh login succeeded.",
+            "why": "Drops the old port from sshd; rollback remains available "
+                   "via ssh-cutover-rollback.",
+            "check_task": "ssh",
+        },
+        {
+            "id": "data_destination",
+            "task": "data",
+            "kind": "prompt_value",
+            "title": "Data sync destination",
+            "target": "data.destination",
+            "message": "rsync destination user@host:/path (blank = skip)",
+            "why": "Needed by the guided sync-data actions; stays in the "
+                   "in-memory target manifest.",
+            "check_task": "data",
+        },
+        {
+            "id": "data_sync_dry",
+            "task": "data",
+            "kind": "guided_subprocess",
+            "command_id": "sync_data",
+            "dry_run": True,
+            "title": "Dry-run data sync",
+            "confirm": "Review the rsync preview, then press Enter.",
+            "why": "Runs `vpsclone sync-data --dry-run` with the destination "
+                   "you entered.",
+            "check_task": "data",
+        },
+        {
+            "id": "data_sync_live",
+            "task": "data",
+            "kind": "guided_subprocess",
+            "command_id": "sync_data",
+            "dry_run": False,
+            "title": "Run data sync",
+            "confirm": "After rsync finishes, press Enter to continue.",
+            "why": "Runs `vpsclone sync-data` with the destination you entered.",
+            "check_task": "data",
+        },
+        {
             "id": "vault_unpack",
             "task": "vault",
             "kind": "guided_subprocess",
@@ -1320,13 +1795,25 @@ def binary_install_actions(data: dict) -> list[dict]:
     return out
 
 
-_SECRET_PATTERNS = [
-    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"(?i)(authorization\s*:|token\s*=|password\s*=|passwd\s*=)"),
-    re.compile(r"https://[^/\s:@]+:[^/\s@]+@"),
-    re.compile(r"(?i)private[_-]?key"),
-]
+def user_key_actions(m: dict) -> list[dict]:
+    """One public-key prompt per target-added user with no key source yet."""
+    out: list[dict] = []
+    for i, u in enumerate(m.get("users", [])):
+        if u.get("authorized_keys") or u.get("authorized_keys_inline"):
+            continue
+        name = str(u.get("name", f"user-{i}"))
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or f"user{i}"
+        out.append({
+            "id": f"user_key_{i}_{slug}",
+            "task": "accounts",
+            "kind": "prompt_value",
+            "title": f"Public SSH key for {name}",
+            "target": f"users.{i}.authorized_keys_inline",
+            "message": "Paste public key line(s) (blank = skip)",
+            "why": u.get("home", ""),
+            "check_task": "accounts",
+        })
+    return out
 
 
 def _find_secret_paths(value, path: str = "manifest") -> list[str]:
@@ -1338,7 +1825,7 @@ def _find_secret_paths(value, path: str = "manifest") -> list[str]:
         for i, v in enumerate(value):
             hits += _find_secret_paths(v, f"{path}[{i}]")
     elif isinstance(value, str):
-        if any(p.search(value) for p in _SECRET_PATTERNS):
+        if any(p.search(value) for p in SECRET_PATTERNS):
             hits.append(path)
     return hits
 
@@ -1565,6 +2052,7 @@ def op_drive(args) -> int | None:
 
     ps = target_spec.get("ssh_port", {})
     src_port = str(src.get("ssh_port", m["ssh"].get("port", "22")))
+    m["ssh"]["old_port"] = src_port
     if ps.get("prompt") or (ps.get("prompt_if_default") and src_port == "22"):
         m["ssh"]["port"] = _ask(str(ps.get("default", src_port)),
                                 ps.get("message"), "ssh port", validate="port")
@@ -1599,7 +2087,7 @@ def op_drive(args) -> int | None:
                     "name": name, "home": f"/home/{name}", "shell": "/bin/bash",
                     "group": name, "groups": [], "sudo_group": "",
                     "ssh_allow": True, "create_home": True,
-                    "authorized_keys": "",
+                    "authorized_keys": "", "authorized_keys_inline": "",
                 })
         m["users"] = rebuilt
 
@@ -1635,6 +2123,9 @@ def op_drive(args) -> int | None:
         )
         return op_apply(ns)
     if args.tui:
+        # Target-added users are only known after the prompt above; expose their
+        # key entry as actions without ever writing back to mirror.toml.
+        plan.setdefault("actions", []).extend(user_key_actions(m))
         return run_tui(plan, m)
     return 0
 
@@ -1656,7 +2147,8 @@ def _tui_put(stdscr, y, x, text, attr=0) -> None:
         pass
 
 
-def _tui_modal(stdscr, title: str, lines: list[str]) -> None:
+def _tui_modal(stdscr, title: str, lines: list[str], *,
+               footer: str | None = None, allow_no: bool = False) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     width = min(w - 4, 76)
@@ -1673,18 +2165,35 @@ def _tui_modal(stdscr, title: str, lines: list[str]) -> None:
     for i, line in enumerate(lines[:height - 4]):
         _tui_put(stdscr, y0 + 2 + i, x0 + 2, line)
     _tui_put(stdscr, y0 + height - 2, x0 + 2,
-             "Enter=continue   r=retry   s=skip   q=quit")
+             footer or "Enter=continue   r=retry   s=skip   q=quit")
     stdscr.refresh()
     while True:
         ch = stdscr.getch()
         if ch in (10, 13, getattr(_TUI_CURSES, "KEY_ENTER", -1)):
             return "enter"
+        if allow_no and ch in (ord("n"), ord("N")):
+            return "no"
         if ch in (ord("r"), ord("R")):
             return "retry"
         if ch in (ord("s"), ord("S")):
             return "skip"
         if ch in (ord("q"), ord("Q"), 27):
             return "quit"
+
+
+CONVERGENCE_FOR_TASK = {
+    "accounts": ("user:", "key:"),
+    "packages": ("apt:", "npm:", "pipx:", "cargo:", "mise:"),
+    "system": ("system:",),
+    "services": ("service:",),
+    "dotfiles": ("dotfile:",),
+    "repos": ("repo:",),
+    "apps": ("binary:",),
+    "deploy_key": ("manual:github",),
+    "vault": ("manual:vault",),
+    "data": ("manual:data",),
+    "ssh": ("ssh:", "manual:login"),
+}
 
 
 def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]:
@@ -1697,7 +2206,12 @@ def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]
         status = "PASS" if ok else ("WARN" if warn else "FAIL")
         out.append((label, status, str(detail)))
 
-    home = m["target"]["home"]
+    conv = check_convergence(m, dry=dry)
+
+    def add_conv(*prefixes: str) -> None:
+        for label, ok, detail, warn in conv:
+            if any(label.startswith(p) for p in prefixes):
+                ck(label, ok, detail, warn)
 
     if name == "preflight":
         ck("plan integrity", True, "verified by drive")
@@ -1705,35 +2219,15 @@ def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]
         ck("target reachability", False, "verify SSH from your local shell", warn=True)
 
     elif name == "accounts":
+        add_conv("user:", "key:")
         for u in effective_users(m):
-            ck(f"user {u['name']}", user_exists(u["name"]))
             if u.get("sudo_group"):
                 ck(f"sudo:{u['name']}", in_group(u["name"], u["sudo_group"]))
-            ak = u.get("authorized_keys", "")
-            if ak:
-                src = REPO / ak
-                dst = Path(u["home"]) / ".ssh/authorized_keys"
-                ck(f"keys:{u['name']}",
-                   src.is_file() and dst.is_file() and src.read_bytes() == dst.read_bytes())
 
     elif name == "packages":
-        for check in ("dpkg:ufw", "dpkg:fail2ban", "dpkg:openssh-server", "dpkg:zsh"):
-            pkg = check.split(":", 1)[1]
-            ck(pkg, pkg_installed(pkg))
-        cargo = m.get("packages", {}).get("cargo", [])
-        if cargo:
-            rc, out = cmd(["cargo", "install", "--list"],
-                          quiet=True, env={"HOME": home})
-            if rc:
-                ck("cargo_tools", False, "cargo unavailable on target", warn=True)
-            else:
-                installed = set()
-                for line in out.splitlines():
-                    m2 = _CARGO_LIST_RE.match(line.strip())
-                    if m2:
-                        installed.add(m2.group(1))
-                for crate in cargo:
-                    ck(f"cargo:{crate}", crate in installed)
+        for pkg in ("ufw", "fail2ban", "openssh-server", "zsh"):
+            ck(f"dpkg:{pkg}", _pkg_installed(pkg))
+        add_conv("apt:", "npm:", "pipx:", "cargo:", "mise:")
 
     elif name == "firewall":
         rc, out_s = cmd(["ufw", "status", "verbose"], quiet=True)
@@ -1745,56 +2239,37 @@ def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]
                 ck(f"rule {rule}", rule in out_s)
 
     elif name == "ssh":
-        ck("sshd -t", cmd(["sshd", "-t"], quiet=True)[0] == 0)
-        port = str(m["ssh"]["port"])
-        rc, ss = cmd(["ss", "-tulpn"], quiet=True)
-        ck(f"port {port} listening", rc == 0 and (f":{port} " in ss or f":{port}\n" in ss))
-        dropin = Path("/etc/ssh/sshd_config.d/99-vpsclone.conf")
-        body = dropin.read_text() if dropin.is_file() else ""
-        ck("key-only auth", "PasswordAuthentication no" in body
-           and "PubkeyAuthentication yes" in body)
-        expected = [u["name"] for u in effective_users(m) if u["ssh_allow"]]
-        allow_m = re.search(r"(?m)^AllowUsers\s+(.+)$", body)
-        allow = set(allow_m.group(1).split()) if allow_m else set()
-        ck("AllowUsers", all(u in allow for u in expected),
-           "missing: " + ",".join(u for u in expected if u not in allow))
-        ck("fresh SSH login", False, "test from a new local terminal", warn=True)
+        add_conv("ssh:", "manual:login")
 
     elif name == "system":
         ck("hostname", socket.gethostname() == m["target"]["hostname"])
         rc, tz = cmd(["timedatectl", "show", "-p", "Timezone", "--value"], quiet=True)
         ck("timezone", rc == 0 and tz.strip() == m.get("system", {}).get("timezone"))
-        for target, src in m.get("system_files", {}).items():
-            s, d = REPO / src, Path(target)
-            ck(target, s.is_file() and d.is_file() and s.read_bytes() == d.read_bytes())
+        add_conv("system:")
 
     elif name == "services":
-        for s in m.get("services", {}).get("enable", []):
-            rc, state = cmd(["systemctl", "is-active", s], quiet=True)
-            ck(s, rc == 0 and state.strip() == "active", state.strip())
+        add_conv("service:")
 
     elif name == "dotfiles":
-        for target, src in m.get("dotfiles", {}).items():
-            s, d = REPO / src, expand(target, home)
-            ck(target, s.is_file() and d.is_file() and s.read_bytes() == d.read_bytes())
+        add_conv("dotfile:")
 
     elif name == "deploy_key":
-        rc, _ = cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                     "-T", "git@github.com"], quiet=True)
-        ck("github ssh", rc in (0, 1), f"rc={rc}")
+        rc, out_s = cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                         "-T", "git@github.com"], quiet=True)
+        detail = out_s.strip()[:120] or f"rc={rc}"
+        ok = rc in (0, 1) and ("successfully authenticated" in out_s.lower()
+                               or out_s.lower().startswith("hi "))
+        ck("github ssh", ok, detail)
+        add_conv("manual:github")
 
     elif name == "repos":
-        for r in m.get("repos", []):
-            p = expand(r["path"], home)
-            ck(r["path"], (p / ".git").exists())
+        add_conv("repo:")
 
     elif name == "apps":
-        for b in m.get("binaries", []):
-            p = expand(b["path"], home)
-            ck(b["name"], p.is_file() and os.access(p, os.X_OK))
+        add_conv("binary:")
 
     elif name in ("vault", "data"):
-        ck(name, False, "manual/out-of-band step - verify yourself", warn=True)
+        add_conv(f"manual:{name}")
 
     elif name == "verify":
         ck("post-apply verify",
@@ -1834,7 +2309,7 @@ def _tui_dispatch(run: str, m: dict, dry: bool) -> tuple[int, bool]:
     return 0, False
 
 
-def _action_argv(action: dict) -> list[str] | None:
+def _action_argv(action: dict, m: dict | None = None) -> list[str] | None:
     exe = [sys.executable, str(Path(__file__).resolve())]
     cid = action.get("command_id")
     if cid == "keygen":
@@ -1845,6 +2320,38 @@ def _action_argv(action: dict) -> list[str] | None:
         if action.get("profile"):
             argv += ["--profile", str(action["profile"])]
         return argv
+    if cid == "github_ssh":
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                "-T", "git@github.com"]
+    if cid == "ssh_cutover_prepare":
+        argv = [*exe, "ssh-cutover-prepare"]
+        if action.get("rollback_seconds"):
+            argv += ["--rollback-seconds", str(action["rollback_seconds"])]
+        return argv
+    if cid == "ssh_cutover_commit":
+        return [*exe, "ssh-cutover-commit", "--confirm-login"]
+    if cid == "ssh_cutover_rollback":
+        return [*exe, "ssh-cutover-rollback"]
+    if cid == "sync_data":
+        dest = str((m or {}).get("data", {}).get("destination", "")).strip()
+        if (not dest or dest.startswith("-")
+                or not re.fullmatch(r"[^\s:]+:[^\s]+", dest)):
+            return None
+        argv = [*exe, "sync-data"]
+        if action.get("dry_run"):
+            argv.append("--dry-run")
+        data = (m or {}).get("data", {})
+        for p in data.get("paths", []) or []:
+            p = str(p)
+            if not (p.startswith("/") or p.startswith("~/")) or "\n" in p:
+                return None
+            argv += ["--path", p]
+        for ex in data.get("exclude", []) or []:
+            ex = str(ex)
+            if ex.startswith("-") or "\n" in ex:
+                return None
+            argv += ["--exclude", ex]
+        return [*argv, "--destination", dest]
     return None
 
 
@@ -1932,8 +2439,22 @@ def _tui_run_action(stdscr, action: dict, m: dict, dry: bool,
         else:
             _tui_modal(stdscr, title, ["No value entered; left unchanged."])
 
+    elif kind == "prompt_bool":
+        ans = _tui_modal(
+            stdscr, title,
+            [str(action.get("why", "")), "", str(action.get("message", "Allow?")),
+             "", "No keeps plain files; yes recreates recorded symlinks."],
+            footer="Enter=yes   n=no   s=skip   q=quit", allow_no=True)
+        if ans in ("skip", "quit"):
+            return ans, [], rc
+        value = ans == "enter"
+        if not _set_manifest_value(m, str(action.get("target", "")), value):
+            _tui_modal(stdscr, "INVALID TARGET",
+                       [f"cannot store value at {action.get('target')!r}"])
+            return "skip", [], rc
+
     elif kind == "guided_subprocess":
-        argv = _action_argv(action)
+        argv = _action_argv(action, m)
         if not argv:
             ans = _tui_modal(stdscr, "UNSUPPORTED ACTION",
                              [f"command_id={action.get('command_id')!r}"])
@@ -2223,10 +2744,15 @@ def op_plan(args) -> None:
     missing = [p for p in pkgs.get("apt", []) if not pkg_installed(p)]
     rows.append(("apt packages", f"{len(missing)} to install" if missing else "ok",
                  ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else "")))
+    def pinned_count(installer: str) -> int:
+        return sum(1 for v in expected_versions(m, installer).values() if v)
+
     rows.append(("npm/pipx", "ok",
-                 f"{len(pkgs.get('npm', []))}/{len(pkgs.get('pipx', []))} configured - replayed on apply"))
+                 f"{len(expected_versions(m, 'npm'))}/{len(expected_versions(m, 'pipx'))} "
+                 f"configured ({pinned_count('npm')}/{pinned_count('pipx')} pinned)"))
     rows.append(("cargo", "ok",
-                 f"{len(pkgs.get('cargo', []))} recorded - replayed via cargo install"))
+                 f"{len(expected_versions(m, 'cargo'))} recorded "
+                 f"({pinned_count('cargo')} pinned) - replayed via cargo install"))
 
     users = effective_users(m)
     missing_users = [u["name"] for u in users if not user_exists(u["name"])]
@@ -2265,9 +2791,10 @@ def op_plan(args) -> None:
     rows.append(("services", f"{len(noton)} to enable" if noton else "ok", ", ".join(noton)))
 
     repos = m.get("repos", [])
+    pinnedrepos = sum(1 for r in repos if str(r.get("commit", "")).strip())
     missingrepos = [r["path"] for r in repos if not expand(r["path"], home).exists()]
     rows.append(("repos", f"{len(missingrepos)} to clone" if missingrepos else "ok",
-                 ", ".join(missingrepos)))
+                 f"{pinnedrepos} commit-pinned; " + ", ".join(missingrepos[:6])))
 
     bins = [b["name"] for b in m.get("binaries", [])
             if not expand(b["path"], home).exists()]
@@ -2333,6 +2860,45 @@ def write_managed(src, dst, *, mode=None, owner=None, backups: Backups | None = 
     return True
 
 
+def write_managed_symlink(link: str, dst: Path, *, home: str, owner: str,
+                          backups: Backups | None = None) -> bool:
+    """Recreate a captured dotfile symlink, safely and idempotently."""
+    d = Path(dst)
+    target = safe_link_target(link, home)
+    assert_no_symlink_components(d.parent)
+    st = lstat(d)
+    if st is not None and stat.S_ISLNK(st.st_mode):
+        if os.readlink(d) == target:
+            return False
+        d.unlink()
+    elif st is not None:
+        if not stat.S_ISREG(st.st_mode):
+            die(f"refusing to replace non-regular file with symlink: {d}")
+        if backups is not None:
+            backups.take(d)
+        d.unlink()
+    d.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(target, d)
+    if owner:
+        os.chown(d, pwd.getpwnam(owner).pw_uid, -1, follow_symlinks=False)
+    log(f"linked {d} -> {target}")
+    return True
+
+
+def write_text_managed(text: str, dst, *, mode=None, owner=None,
+                       backups: Backups | None = None) -> bool:
+    data = (text.rstrip("\n") + "\n").encode()
+    d = Path(dst)
+    assert_regular_file(d, must_exist=False)
+    if d.exists() and d.read_bytes() == data:
+        return False
+    if backups is not None:
+        backups.take(d)
+    write_bytes_no_symlink(d, data, mode=mode, owner=owner)
+    log(f"wrote {d}")
+    return True
+
+
 def step_packages(m, dry, backups) -> None:
     pkgs = m.get("packages", {})
     user = m["target"]["user"]
@@ -2350,30 +2916,36 @@ def step_packages(m, dry, backups) -> None:
         cmd(["apt-get", "install", "-y", "-qq", "--", *missing], check=True, env=apt_env)
         log(f"apt: installed {len(missing)} packages")
 
-    npm = sorted(set(str(x) for x in pkgs.get("npm", []) if str(x).strip()))
-    if npm:
+    npm_want = expected_versions(m, "npm")
+    npm_specs = []
+    for name, ver in npm_want.items():
+        if name.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_@./+-]+", name):
+            log(f"npm: unsafe package name skipped: {name!r}", "WARN")
+            continue
+        npm_specs.append(f"{name}@{ver}" if ver
+                         and re.fullmatch(r"[0-9A-Za-z_.+-]+", ver) else name)
+    if npm_specs:
         if dry:
-            log(f"npm: would install {len(npm)} global packages")
+            log(f"npm: would install {len(npm_specs)} pinned global package(s)")
         elif not shutil.which("npm"):
             log("npm not installed, skipping global packages", "WARN")
         else:
-            rc, out = cmd(["npm", "install", "-g", "--", *npm],
+            rc, out = cmd(["npm", "install", "-g", "--", *npm_specs],
                           as_user=user, env=env, check=False)
             log(f"npm global packages: {'ok' if rc == 0 else 'FAILED'} {out.strip()[:120]}",
                 "INFO" if rc == 0 else "WARN")
 
-    pipx = sorted(set(str(x) for x in pkgs.get("pipx", []) if str(x).strip()))
-    if pipx:
+    pipx_want = expected_versions(m, "pipx")
+    if pipx_want:
         if dry:
-            log(f"pipx: would install {len(pipx)} tools")
+            log(f"pipx: would install {len(pipx_want)} pinned tool(s)")
         elif not shutil.which("pipx"):
             log("pipx not installed, skipping tools", "WARN")
         else:
             failed = []
-            for item in pipx:
-                parts = item.rsplit(" ", 1)
-                spec = f"{parts[0]}=={parts[1]}" if len(parts) == 2 and parts[1] else parts[0]
-                if spec.startswith("-"):
+            for name, ver in pipx_want.items():
+                spec = f"{name}=={ver}" if ver else name
+                if spec.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.+=-]+", spec):
                     log(f"pipx: unsafe spec skipped: {spec!r}", "WARN")
                     continue
                 rc, out = cmd(["pipx", "install", spec], as_user=user, env=env, check=False)
@@ -2382,25 +2954,28 @@ def step_packages(m, dry, backups) -> None:
             log(f"pipx tools: {'ok' if not failed else 'FAILED'} {'; '.join(failed)[:160]}",
                 "INFO" if not failed else "WARN")
 
-    cargo = sorted({str(x).strip() for x in pkgs.get("cargo", []) if str(x).strip()})
+    cargo_want = expected_versions(m, "cargo")
     safe_cargo = []
-    for name in cargo:
+    for name, ver in cargo_want.items():
         if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", name):
-            safe_cargo.append(name)
+            safe_cargo.append((name, ver))
         else:
             log(f"cargo: unsafe crate name skipped: {name!r}", "WARN")
     if safe_cargo:
         if dry:
-            log(f"cargo: would install {len(safe_cargo)} crate(s)")
+            log(f"cargo: would install {len(safe_cargo)} pinned crate(s)")
         elif not shutil.which("cargo"):
             log("cargo not installed, skipping crate installs", "WARN")
         else:
             failed = []
-            for name in safe_cargo:
-                rc, out = cmd(["cargo", "install", name],
-                              as_user=user, env=env, check=False)
+            for name, ver in safe_cargo:
+                argv = ["cargo", "install", name]
+                if ver and re.fullmatch(r"[0-9A-Za-z_.+-]+", ver):
+                    argv += ["--version", ver]
+                rc, out = cmd(argv, as_user=user, env=env, check=False)
                 if rc:
-                    failed.append(f"{name}: {out.strip().splitlines()[-1] if out.strip() else 'failed'}")
+                    failed.append(f"{name}@{ver or 'latest'}: "
+                                  f"{out.strip().splitlines()[-1] if out.strip() else 'failed'}")
             log(f"cargo crates: {'ok' if not failed else 'FAILED'} {'; '.join(failed)[:160]}",
                 "INFO" if not failed else "WARN")
 
@@ -2484,8 +3059,9 @@ def step_users(m, dry, backups) -> None:
             os.chmod(home, 0o755)
 
         ak_rel = u.get("authorized_keys", "")
+        inline_keys = str(u.get("authorized_keys_inline", "") or "").strip()
         src = repo_asset(ak_rel) if ak_rel else None
-        need_ssh = bool(src) or u["ssh_allow"]
+        need_ssh = bool(src) or bool(inline_keys) or u["ssh_allow"]
         if need_ssh and not create_home and not home.is_dir():
             log(f"users: home {home} missing for {name}; skipping ssh setup", "WARN")
             need_ssh = False
@@ -2498,8 +3074,16 @@ def step_users(m, dry, backups) -> None:
                 sshdir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 os.chmod(sshdir, 0o700)
                 shutil.chown(sshdir, user=name)
-            if src and src.is_file():
-                target_ak = sshdir / "authorized_keys"
+            target_ak = sshdir / "authorized_keys"
+            if inline_keys:
+                want = (inline_keys.rstrip("\n") + "\n").encode()
+                if dry:
+                    if not target_ak.exists() or target_ak.read_bytes() != want:
+                        log(f"users: would write inline keys to {target_ak}")
+                else:
+                    write_text_managed(inline_keys, target_ak, mode=0o600,
+                                       owner=name, backups=backups)
+            elif src and src.is_file():
                 if dry:
                     if (not target_ak.exists() or
                             target_ak.read_bytes() != src.read_bytes()):
@@ -2535,16 +3119,29 @@ def step_users(m, dry, backups) -> None:
 def step_dotfiles(m, dry, backups) -> None:
     home = m["target"]["home"]
     owner = m["target"]["user"]
+    allow_links = str(m.get("policy", {}).get("allow_symlinks", False)).lower() \
+        in {"1", "true", "yes", "y"}
+    links = (m.get("baseline", {}).get("dotfile_symlinks", {}) or {})
     n = 0
     for target, src in m.get("dotfiles", {}).items():
         d = expand(target, home)
         s = REPO / src
         mode = 0o600 if str(d).endswith("/.ssh/config") else None
+        link = links.get(target) if allow_links else None
         if dry:
             if not s.is_file():
                 log(f"dotfiles: missing source {s}", "WARN")
+            elif link:
+                want = safe_link_target(link, home)
+                if not d.is_symlink() or os.readlink(d) != want:
+                    log(f"dotfiles: would link {d} -> {want}")
+                    n += 1
             elif not d.is_file() or d.read_bytes() != s.read_bytes():
                 log(f"dotfiles: would write {d}")
+                n += 1
+        elif link:
+            if write_managed_symlink(link, d, home=home, owner=owner,
+                                     backups=backups):
                 n += 1
         elif write_managed(s, d, mode=mode, owner=owner, backups=backups):
             n += 1
@@ -2613,29 +3210,231 @@ def ssh_unit() -> str:
     return "sshd" if rc == 0 and "sshd.service" in out else "ssh"
 
 
-def step_ssh(m, dry, backups) -> None:
-    src = REPO / m["ssh"]["hardening_file"]
-    dst = Path("/etc/ssh/sshd_config.d/99-vpsclone.conf")
-    if dry:
-        log(f"ssh: would write {dst} and reload sshd (port {m['ssh']['port']})")
+CUTOVER_STATE = REPO / "ssh-cutover.json"
+FINAL_DROPIN = Path("/etc/ssh/sshd_config.d/99-vpsclone.conf")
+CUTOVER_DROPIN = Path("/etc/ssh/sshd_config.d/99-vpsclone-cutover.conf")
+
+
+def _valid_port(value: str) -> bool:
+    return value.isdigit() and 1 <= int(value) <= 65535
+
+
+def _active_ssh_ports() -> list[str]:
+    rc, out = cmd(["sshd", "-T"], quiet=True)
+    if rc:
+        return []
+    return sorted({p for p in re.findall(r"(?m)^port\s+(\d+)\s*$", out)
+                   if _valid_port(p)})
+
+
+def _port_listening(port: str) -> bool:
+    rc, out = cmd(["ss", "-tulpn"], quiet=True)
+    return rc == 0 and (f":{port} " in out or f":{port}\n" in out)
+
+
+def _write_dropin(path: Path, body: str) -> None:
+    assert_regular_file(path, must_exist=False)
+    write_bytes_no_symlink(path, body.encode(), mode=0o644)
+
+
+def _restore_ssh_files(final_bytes: bytes | None,
+                       cutover_bytes: bytes | None) -> None:
+    for path, data in ((FINAL_DROPIN, final_bytes),
+                       (CUTOVER_DROPIN, cutover_bytes)):
+        if data is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_dropin(path, data.decode())
+
+
+def _load_cutover() -> dict | None:
+    if not CUTOVER_STATE.is_file():
+        return None
+    try:
+        state = json.loads(CUTOVER_STATE.read_text())
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) and {"old_port", "new_port"} <= state.keys() else None
+
+
+def _save_cutover(state: dict) -> None:
+    atomic_write_text(CUTOVER_STATE, json.dumps(state, sort_keys=True) + "\n",
+                      mode=0o600)
+
+
+def _spawn_cutover_watchdog(seconds: int, token: str) -> None:
+    """Detached timer: roll back if the cutover is not committed in time."""
+    if seconds <= 0:
         return
+    exe = [sys.executable, str(Path(__file__).resolve())]
+    subprocess.Popen(
+        [*exe, "ssh-cutover-watchdog", "--seconds", str(seconds), "--id", token],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True, cwd=str(REPO),
+    )
+
+
+def ssh_cutover_prepare(m: dict, backups, rollback_seconds: int = 600) -> None:
+    """Open both ports, reload, verify, then wait for explicit commit."""
+    src = REPO / m["ssh"]["hardening_file"]
     if not src.is_file():
         log("ssh: hardening file missing", "WARN")
         return
-    assert_regular_file(dst, must_exist=False)
-    body = render_dropin(m, src.read_text()).encode()
-    prev = dst.read_bytes() if dst.is_file() else None
-    backups.take(dst)
-    write_bytes_no_symlink(dst, body, mode=0o644)
+    new_port = str(m["ssh"]["port"])
+    old_port = str(m["ssh"].get("old_port", "") or "")
+    if not old_port or old_port == new_port:
+        old_port = next((p for p in _active_ssh_ports() if p != new_port), "")
+    if not _valid_port(new_port):
+        die(f"invalid ssh port in manifest: {new_port!r}")
+
+    final_body = render_dropin(m, src.read_text())
+    prev_final = FINAL_DROPIN.read_bytes() if FINAL_DROPIN.is_file() else None
+    prev_cutover = CUTOVER_DROPIN.read_bytes() if CUTOVER_DROPIN.is_file() else None
+
+    if not old_port or old_port == new_port:
+        backups.take(FINAL_DROPIN)
+        _write_dropin(FINAL_DROPIN, final_body)
+        CUTOVER_DROPIN.unlink(missing_ok=True)
+        CUTOVER_STATE.unlink(missing_ok=True)
+        rc, out = cmd(["sshd", "-t"])
+        if rc:
+            _restore_ssh_files(prev_final, prev_cutover)
+            die(f"sshd -t failed; reverted drop-in:\n{out.strip()}")
+        cmd(["systemctl", "reload", ssh_unit()], check=False)
+        log(f"ssh: no port change ({new_port}); final drop-in applied")
+        return
+
+    dual, n = re.subn(r"(?m)^Port\s+\d+\s*$",
+                      f"Port {old_port}\nPort {new_port}", final_body, count=1)
+    if n == 0:
+        dual = f"Port {old_port}\nPort {new_port}\n{final_body}"
+
+    backups.take(FINAL_DROPIN)
+    _write_dropin(CUTOVER_DROPIN, dual)
+    FINAL_DROPIN.unlink(missing_ok=True)
     rc, out = cmd(["sshd", "-t"])
     if rc:
-        if prev is None:
-            dst.unlink(missing_ok=True)
-        else:
-            write_bytes_no_symlink(dst, prev, mode=0o644)
+        _restore_ssh_files(prev_final, prev_cutover)
         die(f"sshd -t failed; reverted drop-in:\n{out.strip()}")
+    rc, out = cmd(["systemctl", "reload", ssh_unit()], check=False)
+    if rc:
+        _restore_ssh_files(prev_final, prev_cutover)
+        cmd(["systemctl", "reload", ssh_unit()], check=False)
+        die(f"sshd reload failed; reverted drop-in:\n{out.strip()}")
+    if not (_port_listening(new_port) and _port_listening(old_port)):
+        _restore_ssh_files(prev_final, prev_cutover)
+        cmd(["systemctl", "reload", ssh_unit()], check=False)
+        die(f"sshd did not listen on both ports ({old_port}, {new_port}); reverted")
+
+    token = secrets.token_hex(8)
+    _save_cutover({
+        "old_port": old_port,
+        "new_port": new_port,
+        "prepared_at": now(),
+        "watchdog_id": token,
+        "rollback_seconds": rollback_seconds,
+        "previous_final": prev_final.decode() if prev_final is not None else None,
+        "previous_cutover": (prev_cutover.decode()
+                             if prev_cutover is not None else None),
+    })
+    _spawn_cutover_watchdog(rollback_seconds, token)
+    log(f"ssh: prepared dual-port cutover {old_port} -> {new_port} (both live)")
+    log(f"ssh: auto-rollback in {rollback_seconds}s if not committed")
+    log("ssh: verify a FRESH login on the new port, then run "
+        "ssh-cutover-commit --confirm-login (or ssh-cutover-rollback)")
+
+
+def ssh_cutover_commit(m: dict, backups) -> None:
+    state = _load_cutover()
+    if not state:
+        die("no prepared ssh cutover found (run ssh-cutover-prepare first)")
+    new_port = str(m["ssh"]["port"])
+    if str(state["new_port"]) != new_port:
+        die(f"manifest port {new_port} no longer matches prepared cutover "
+            f"{state['new_port']}; run ssh-cutover-rollback first")
+    src = REPO / m["ssh"]["hardening_file"]
+    if not src.is_file():
+        die("hardening file missing; cannot commit ssh cutover")
+
+    prev_final = (state.get("previous_final") or "").encode() \
+        if state.get("previous_final") is not None else None
+    prev_cutover = CUTOVER_DROPIN.read_bytes() if CUTOVER_DROPIN.is_file() else None
+    backups.take(FINAL_DROPIN)
+    _write_dropin(FINAL_DROPIN, render_dropin(m, src.read_text()))
+    CUTOVER_DROPIN.unlink(missing_ok=True)
+    rc, out = cmd(["sshd", "-t"])
+    if rc:
+        _restore_ssh_files(prev_final, prev_cutover)
+        die(f"sshd -t failed during commit; reverted:\n{out.strip()}")
+    rc, out = cmd(["systemctl", "reload", ssh_unit()], check=False)
+    if rc or not _port_listening(new_port):
+        _restore_ssh_files(prev_final, prev_cutover)
+        cmd(["systemctl", "reload", ssh_unit()], check=False)
+        die(f"ssh commit failed on port {new_port}; reverted:\n{out.strip()}")
+    CUTOVER_STATE.unlink(missing_ok=True)
+    log(f"ssh: cutover committed on port {new_port}; old firewall rule left "
+        "for manual cleanup")
+
+
+def ssh_cutover_rollback() -> None:
+    state = _load_cutover()
+    if not state:
+        die("no prepared ssh cutover found")
+    prev_final = (state.get("previous_final") or "").encode() \
+        if state.get("previous_final") is not None else None
+    prev_cutover = (state.get("previous_cutover") or "").encode() \
+        if state.get("previous_cutover") is not None else None
+    _restore_ssh_files(prev_final, prev_cutover)
+    rc, out = cmd(["sshd", "-t"])
+    if rc:
+        die(f"sshd -t failed after rollback:\n{out.strip()}")
     cmd(["systemctl", "reload", ssh_unit()], check=False)
-    log("ssh: drop-in valid, sshd reloaded")
+    CUTOVER_STATE.unlink(missing_ok=True)
+    log(f"ssh: rolled back to port {state['old_port']}")
+
+
+def op_ssh_cutover_prepare(args) -> None:
+    if not is_root():
+        die("ssh cutover needs root")
+    seconds = int(getattr(args, "rollback_seconds", 600) or 0)
+    if seconds < 0:
+        die("rollback seconds must be >= 0")
+    ssh_cutover_prepare(load_manifest(),
+                        Backups(dt.datetime.now().strftime("%Y%m%d-%H%M%S")),
+                        rollback_seconds=seconds)
+
+
+def op_ssh_cutover_commit(args) -> None:
+    if not getattr(args, "confirm_login", False):
+        die("refusing ssh commit without --confirm-login; "
+            "test a fresh SSH session first")
+    if not is_root():
+        die("ssh cutover needs root")
+    ssh_cutover_commit(load_manifest(),
+                       Backups(dt.datetime.now().strftime("%Y%m%d-%H%M%S")))
+
+
+def op_ssh_cutover_rollback(args) -> None:
+    if not is_root():
+        die("ssh cutover needs root")
+    ssh_cutover_rollback()
+
+
+def op_ssh_cutover_watchdog(args) -> None:
+    seconds = int(args.seconds)
+    if seconds < 0:
+        die("invalid watchdog interval")
+    time.sleep(seconds)
+    state = _load_cutover()
+    if state and str(state.get("watchdog_id", "")) == str(args.id):
+        ssh_cutover_rollback()
+
+
+def step_ssh(m, dry, backups) -> None:
+    if dry:
+        log(f"ssh: would prepare two-phase cutover to port {m['ssh']['port']}")
+        return
+    ssh_cutover_prepare(m, backups)
 
 
 def step_services(m, dry, backups) -> None:
@@ -2702,22 +3501,37 @@ def step_repos(m, dry, backups) -> None:
     user = m["target"]["user"]
     for r in m.get("repos", []):
         p = expand(r["path"], home)
+        want_commit = str(r.get("commit", ""))
         if p.exists():
+            st = git_repo_state(p)
+            if want_commit and st["commit"] and st["commit"] != want_commit:
+                log(f"repo {r['path']}: at {st['commit'][:8]}, "
+                    f"source {want_commit[:8]} (left as-is)", "WARN")
             continue
         if dry:
-            log(f"repos: would clone {r['url']} -> {p}")
+            log(f"repos: would clone {r['url']} -> {p}"
+                + (f" at {want_commit[:8]}" if want_commit else ""))
             continue
         branch = str(r.get("branch", "main"))
         url = str(r["url"])
         if branch.startswith("-") or url.startswith("-"):
             die(f"unsafe repo definition: branch={branch!r} url={url!r}")
+        if want_commit and not re.fullmatch(r"[0-9a-fA-F]{7,40}", want_commit):
+            die(f"unsafe repo commit: {want_commit!r}")
         rc, out = cmd(["git", "clone", "-b", branch, "--", url, str(p)],
                       as_user=user, env={"HOME": home}, check=False)
         if rc:
             log(f"repo {r['path']} not cloned (deploy key may not be on GitHub yet): "
                 f"{out.strip().splitlines()[-1] if out.strip() else ''}", "WARN")
-        else:
-            log(f"cloned {r['path']}")
+            continue
+        log(f"cloned {r['path']}")
+        if want_commit:
+            rc2, out2 = cmd(["git", "-C", str(p), "checkout", "-B", branch,
+                             want_commit], as_user=user, env={"HOME": home},
+                            check=False)
+            log(f"repo {r['path']} commit {want_commit[:8]}: "
+                f"{'ok' if rc2 == 0 else out2.strip()[:80]}",
+                "INFO" if rc2 == 0 else "WARN")
 
 
 def run_hook(path: str, dry: bool) -> None:
@@ -2807,7 +3621,6 @@ def op_apply(args) -> int:
 def op_verify(args) -> int:
     m = getattr(args, "manifest_obj", None) or load_manifest()
     home = m["target"]["home"]
-    port = str(m["ssh"]["port"])
     checks = []
 
     def ck(name, ok, detail="", warn=False):
@@ -2817,22 +3630,13 @@ def op_verify(args) -> int:
     rc, out = cmd(["python3", "--version"], quiet=True)
     ck("python3 >= 3.11", rc == 0 and tuple(map(int, (out.split()[1].split(".")[:2]))) >= (3, 11))
     ck("target user exists", user_exists(m["target"]["user"]), m["target"]["user"])
-    ck("sshd syntax valid", cmd(["sshd", "-t"], quiet=True)[0] == 0)
-    rc, ss = cmd(["ss", "-tulpn"], quiet=True)
-    ck(f"ssh port {port} listening", f":{port} " in ss or f":{port}\n" in ss)
     rc, ufwout = cmd(["ufw", "status"], quiet=True)
     ck("ufw active", rc == 0 and "Status: active" in ufwout)
-    dropin = Path("/etc/ssh/sshd_config.d/99-vpsclone.conf")
-    body = dropin.read_text() if dropin.is_file() else ""
-    ck("ssh key-only auth", "PasswordAuthentication no" in body and "PubkeyAuthentication yes" in body)
-    rc, f2b = cmd(["systemctl", "is-active", "fail2ban"], quiet=True)
-    ck("fail2ban active", rc == 0 and f2b.strip() == "active")
-    ck("dotfiles deployed", all(expand(t, home).exists() for t in m.get("dotfiles", {})))
     dots = Path(home) / ".config/dots/dots"
     ck("dotS installed", dots.exists(), str(dots), warn=True)
-    rc, gitout = cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                      "-T", "git@github.com"], quiet=True)
-    ck("git SSH auth", rc in (0, 1), "pubkey may still need adding to GitHub", warn=True)
+
+    for label, ok, detail, warn in check_convergence(m):
+        ck(label, ok, detail, warn)
 
     print("\nVERIFY\n")
     fails = 0
@@ -2954,7 +3758,8 @@ def op_bundle(args) -> None:
     assert_no_symlink_components(out)
     if out.is_symlink() or (out.exists() and not out.is_file()):
         die(f"refusing unsafe bundle output path: {out}")
-    skip = {".git", "backups", "__pycache__", "reports", "vault", "secrets", ".vault"}
+    skip = {".git", "backups", "__pycache__", "reports", "vault", "secrets",
+            ".vault", "ssh-cutover.json"}
 
     # Validate every member before creating the archive. tarfile.add() on a
     # directory recurses, which would otherwise include denied files before the
@@ -2986,6 +3791,59 @@ def op_bundle(args) -> None:
     size = out.stat().st_size / 1024
     log(f"bundle: {out} ({size:.0f} KiB)")
     log(f"ship it: scp {out} root@new-vps:/opt/")
+
+
+# ------------------------------------------------------------ remote driver
+def remote_ssh_argv(target: str, port: str | int, command: str,
+                    tty: bool = False) -> list[str]:
+    argv = ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=ask"]
+    if tty:
+        argv.append("-tt")
+    return [*argv, target, command]
+
+
+def remote_scp_argv(target: str, port: str | int,
+                    src: Path, remote_path: str) -> list[str]:
+    return ["scp", "-P", str(port), str(src), f"{target}:{remote_path}"]
+
+
+def op_remote_drive(args) -> int:
+    """Bundle locally, ship over ssh, then run target-side drive in a TTY."""
+    target = validate_ssh_target(args.target)
+    port = str(args.port or 22)
+    if not _valid_port(port):
+        die(f"invalid ssh port: {port!r}")
+
+    def run_with_bundle(bundle: Path) -> int:
+        assert_regular_file(bundle)
+        rc, out = cmd(remote_ssh_argv(
+            target, port, "mktemp -d /tmp/vps-mirror-remote.XXXXXX"),
+            quiet=True, check=True)
+        remote_dir = out.strip()
+        if not re.fullmatch(r"/tmp/vps-mirror-remote\.[A-Za-z0-9]{6}", remote_dir):
+            die(f"unexpected remote temp dir: {remote_dir!r}")
+        cmd(remote_scp_argv(target, port, bundle,
+                            f"{remote_dir}/bundle.tar.gz"), check=True)
+        script = (
+            f"tar xzf {shlex.quote(remote_dir)}/bundle.tar.gz "
+            f"-C {shlex.quote(remote_dir)} && "
+            f"cd {shlex.quote(remote_dir)}/vps-mirror && "
+            "python3 vpsclone drive --plan mirror.toml --tui"
+        )
+        rc, _ = cmd(remote_ssh_argv(target, port, script, tty=True),
+                    capture=False, check=False)
+        if not args.no_cleanup:
+            cmd(remote_ssh_argv(
+                target, port,
+                f"rm -rf -- {shlex.quote(remote_dir)}"), quiet=True)
+        return rc
+
+    if args.bundle:
+        return run_with_bundle(Path(args.bundle).expanduser().absolute())
+    with tempfile.TemporaryDirectory(prefix="vps-mirror-remote-") as td:
+        bundle = Path(td) / "vps-mirror.tar.gz"
+        op_bundle(argparse.Namespace(output=str(bundle)))
+        return run_with_bundle(bundle)
 
 
 # -------------------------------------------------------------- rollback
@@ -3040,7 +3898,7 @@ def op_rollback(args) -> None:
 def op_sync_data(args) -> None:
     m = load_manifest()
     d = m.get("data", {})
-    paths = d.get("paths", [])
+    paths = list(args.paths) if getattr(args, "paths", None) else list(d.get("paths", []))
     if not paths:
         log("no data paths configured in manifest.toml [data] paths = [...]")
         return
@@ -3627,6 +4485,26 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("verify", help="post-apply health checks")
     c.set_defaults(func=op_verify)
 
+    c = sub.add_parser("ssh-cutover-prepare",
+                       help="stage dual-port sshd config; keep old port live")
+    c.add_argument("--rollback-seconds", type=int, default=600)
+    c.set_defaults(func=op_ssh_cutover_prepare)
+
+    c = sub.add_parser("ssh-cutover-commit",
+                       help="finalise ssh port after a fresh-login check")
+    c.add_argument("--confirm-login", action="store_true")
+    c.set_defaults(func=op_ssh_cutover_commit)
+
+    c = sub.add_parser("ssh-cutover-rollback",
+                       help="restore pre-cutover sshd config")
+    c.set_defaults(func=op_ssh_cutover_rollback)
+
+    c = sub.add_parser("ssh-cutover-watchdog",
+                       help=argparse.SUPPRESS)
+    c.add_argument("--seconds", type=int, required=True)
+    c.add_argument("--id", required=True)
+    c.set_defaults(func=op_ssh_cutover_watchdog)
+
     c = sub.add_parser("keygen", help="generate passphrase-protected ssh key")
     c.add_argument("--name", help="key filename (default: deploy-github)")
     c.add_argument("--comment", help="key comment")
@@ -3639,8 +4517,18 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--output", help="output path")
     c.set_defaults(func=op_bundle)
 
+    c = sub.add_parser("remote-drive",
+                       help="bundle, scp and run drive on a fresh VPS")
+    c.add_argument("--target", required=True, help="user@host")
+    c.add_argument("--port", type=int, default=22, help="transport ssh port")
+    c.add_argument("--bundle", help="reuse an existing bundle tar.gz")
+    c.add_argument("--no-cleanup", action="store_true")
+    c.set_defaults(func=op_remote_drive)
+
     c = sub.add_parser("sync-data", help="rsync explicit data allowlist")
     c.add_argument("--destination", help="user@host:/path")
+    c.add_argument("--path", dest="paths", action="append", default=[],
+                   help="absolute source path (repeatable; overrides manifest)")
     c.add_argument("--exclude", action="append", default=[])
     c.add_argument("--dry-run", action="store_true")
     c.set_defaults(func=op_sync_data)

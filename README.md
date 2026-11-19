@@ -22,7 +22,7 @@ vps-mirror/
   mirror.toml              # AUTHORED descriptor: audit facts + prompt flags + task graph
   manifest.toml            # GENERATED from mirror.toml by `audit`/`drive` (engine input)
   denylist.txt             # never capture/bundle anything matching these globs
-  dotfiles/                # allowlisted dotfiles, deployed by symlink-safe copy
+  dotfiles/                # allowlisted dotfiles, deployed as plain files or opt-in symlinks
   ssh/authorized_keys      # PUBLIC keys only
   ssh/sshd_hardening.conf  # generated from server-setup.s @sshHarden
   system/etc/...           # captured system configs (fail2ban, nginx later...)
@@ -60,18 +60,50 @@ git diff mirror.toml        # review, then commit
 (`vpsclone-inventory/1`, stdlib only, feature-inspired by ESR's `inventory` but
 independently implemented) for apt, npm, pipx, cargo and mise. It writes
 `[audit.inventory]` provenance to `mirror.toml` — counts, notes, warnings and a
-records hash; no versions, dates or secrets are stored. apt packages are
-filtered against `/var/log/installer/initial-status*.gz` when available; if
-those logs are missing the unfiltered list is kept and reported as a gap. npm
-scoped names (`@scope/pkg`) are preserved. Cargo crates are replayed with
-`cargo install <name>` from authoritative `cargo install --list` output;
-bin-scan fallback names are warnings only, never install commands.
+records hash. Full installer records (name + version) are kept in
+`[baseline.packages.records]` for pinned replay and convergence checks; no
+passwords, tokens or private keys are stored. Every candidate capture file is
+also content-scanned: token, password and private-key markers cause the file to
+be quarantined rather than bundled. False positives can be released with a
+relative path or `sha256:<hash>` line in `capture-allow.txt`. apt packages are filtered against
+`/var/log/installer/initial-status*.gz` when available; if those logs are
+missing the unfiltered list is kept and reported as a gap. npm scoped names
+(`@scope/pkg`) are preserved. npm/pipx/cargo/mise are replayed at the recorded
+version when one exists; cargo bin-scan fallback names are warnings only, never
+install commands.
+
+**Dotfiles.** `audit` looks for an expanded allowlist: the original shell, git,
+mise, OpenCode and herdr configs plus common files such as `.inputrc`,
+`.tmux.conf`, `.editorconfig`, `.gitattributes`, fish/nvim/helix configs,
+starship/alacritty/kitty/wezterm/foot/zellij configs, ripgrep/fd/lazygit/lsd/bat
+configs, direnv, pip/cargo/gem and XDG housekeeping files. Secret-shaped configs
+(`.npmrc`, `.pypirc`, `.netrc`, cloud/CLI credentials, private keys) are
+intentionally **not** in the list and remain denylisted.
+
+A source dotfile that is a symlink is handled too, as long as its final target
+stays inside the source home. `audit` stores a plain-file copy in `dotfiles/`
+and records the portable `~/...` link target in `[baseline.dotfile_symlinks]`.
+Broken links and links pointing outside the source home are reported as skipped,
+never followed. In the TUI, the **`allow_symlinks`** yes/no action asks
+“Allow captured symlinks?”: `yes` recreates the recorded symlink on the target;
+`no` (the default) writes a regular file instead. `verify` checks whichever mode
+you chose.
+
+**Convergence checks.** `verify` and the TUI now compare target state with the
+effective manifest: package versions, repo URL/branch/commit, source binary
+hashes, service enabled + active state, and file/key contents. Manual-only
+items (fresh SSH login, GitHub key acceptance, vault and data sync) are reported
+as `WARN`, never silently marked `PASS`. Unpinned legacy entries also degrade to
+`WARN` rather than pretending to be verified.
 
 Run the fixture tests with:
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+The remaining pain-reduction backlog is tracked in `A-LIST.md`; all items stay
+active until checked off.
 
 **Step 2 — target drive:**
 
@@ -85,6 +117,19 @@ sudo ./vpsclone drive --plan mirror.toml --tui
 
 Without `--tui`, `drive` resolves the same prompts, writes the manifest and
 prints the suggested next commands (`vpsclone plan && sudo vpsclone apply --dry-run`).
+
+If the bundle is still on your local machine, the thin remote driver ships it
+and opens the target TUI in one shot:
+
+```sh
+python3 vpsclone remote-drive --target user@new-vps --port 22
+# or reuse a bundle you already built:
+python3 vpsclone remote-drive --target user@new-vps --bundle ../vps-mirror-*.tar.gz
+```
+
+`ssh`/`scp` own any authentication prompts; no passwords, tokens or passphrases
+are stored by vpsclone. The remote copy is temporary and removed on exit unless
+`--no-cleanup` is given.
 
 Prompts are flags in `mirror.toml`, for example:
 
@@ -109,6 +154,8 @@ human steps. Press `a` in the TUI to open the Actions pane:
 - `acknowledge` — checklist items that can't be automated (provider snapshot)
 - `prompt_value` — asks for a value and stores it in the in-memory manifest
   only, e.g. `data.paths`
+- `prompt_bool` — yes/no policy question, e.g. `allow_symlinks` (Enter=yes,
+  `n`=no)
 - `guided_subprocess` — suspends curses and runs a known command in a real
   terminal, e.g. `vpsclone keygen` or `vault-unpack`; passphrases stay inside
   the child process
@@ -257,10 +304,25 @@ sudo python3 vpsclone verify
 ```
 
 Ordering note baked into the tool: **UFW port is opened before sshd is
-reloaded**, and `sshd -t` is validated with automatic revert. That follows the
-lockout gotcha in `server-setup.s`. Keep a spare session open the first time.
-`--ssh-port` rewrites the captured `Port` line at apply time, so the firewall,
-drop-in and verifier always agree.
+reloaded**, and `sshd -t` is validated with automatic revert. SSH now uses a
+**two-phase cutover**: `apply` stages a drop-in with both the old and new ports
+live, verifies both are listening, and waits. From a new local terminal, test a
+fresh login on the new port, then finish with:
+
+```sh
+sudo python3 vpsclone ssh-cutover-commit --confirm-login
+# or, if the new login failed:
+sudo python3 vpsclone ssh-cutover-rollback
+```
+
+The prepare/commit/rollback sequence is also exposed as TUI actions
+(`ssh_prepare`, `fresh_login`, `ssh_commit`). A detached watchdog rolls back
+automatically after 600 seconds if the cutover is not committed; override with
+`ssh-cutover-prepare --rollback-seconds N`. The rollback state lives in
+`ssh-cutover.json` (mode `0600`) and is excluded from bundles. The old firewall
+rule is deliberately left for manual cleanup after a successful commit.
+`--ssh-port` rewrites the captured `Port` line so the firewall, drop-in and
+verifier always agree.
 
 ---
 
