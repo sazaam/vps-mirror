@@ -103,7 +103,7 @@ class YagniSmokeTests(unittest.TestCase):
         tasks = set(vpsclone.default_task_defs())
         # firewall is currently checked live (ufw status) in _tui_check_task
         # rather than through a check_convergence prefix.
-        covered = set(vpsclone.CONVERGENCE_FOR_TASK) | {"firewall"}
+        covered = set(vpsclone.CONVERGENCE_FOR_TASK) | {"firewall", "toolchain"}
         expected = tasks - {"preflight", "verify"}
         self.assertLessEqual(expected, covered)
 

@@ -37,3 +37,8 @@ was deliberately taught to do.
 - [x] **8. Clean Git worktree**
   - Only code and docs remain in the repo; all captured data, reports, bundles, vault and rollback state live in `~/.vps-data`.
   - `~/.vps-data` resolves to the invoking user's home even under `sudo`, and is chowned back to that user after root audits.
+
+- [x] **9. Toolchain bootstrapping and project-level dependencies**
+  - Mise-aware tool resolution lists npm/pipx/cargo globals even when the tool is not on plain `PATH`.
+  - Manifest-driven `toolchain` task confirms and installs missing managers before dependent installs.
+  - `[[project_deps]]` records detected Node/Rust managers; skipped-by-default TUI actions and CLI subcommands install per project on request.

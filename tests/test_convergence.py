@@ -162,13 +162,19 @@ class ConvergenceTests(unittest.TestCase):
         original_which = vpsclone.shutil.which
         vpsclone.cmd = fake_cmd
         vpsclone.shutil.which = lambda name: f"/usr/bin/{name}"
+        vpsclone._TOOL_CACHE.clear()
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 vpsclone.step_packages(m, False)
         finally:
             vpsclone.cmd = original_cmd
             vpsclone.shutil.which = original_which
+            vpsclone._TOOL_CACHE.clear()
 
+        def plain(call: list[str]) -> list[str]:
+            return call[3:] if call[:3] == ["mise", "exec", "--"] else call
+
+        calls = [plain(c) for c in calls]
         npm_call = next(c for c in calls if c[:2] == ["npm", "install"])
         self.assertIn("opencode@1.2.3", npm_call)
         self.assertTrue(any(c == ["pipx", "install", "httpie==3.2.0"]

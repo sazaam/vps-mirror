@@ -93,9 +93,25 @@ cause the file to be quarantined rather than bundled. False positives can be
 released with a relative path or `sha256:<hash>` line in `capture-allow.txt`.
 apt packages are filtered against `/var/log/installer/initial-status*.gz` when
 available; if those logs are missing the unfiltered list is kept and reported as
-a gap. npm scoped names (`@scope/pkg`) are preserved. npm/pipx/cargo/mise are
+a gap. npm scoped names (`@scope/pkg`) are preserved. Tool detection goes
+through `mise exec --` when mise can run the tool, so packages managed by a mise
+node tool are listed even when plain `npm` is not on `PATH`. The same resolver is
+used for auditing, replay and convergence checks. npm/pipx/cargo/mise are
 replayed at the recorded version when one exists; an unavailable installer is
 reported as a warning, never guessed from binaries on disk.
+
+**Toolchain and project dependencies.** The manifest is read before replay to
+work out which managers are required (mise/node/npm/pipx/cargo/yarn/pnpm). The
+`toolchain` task/action confirms each missing manager, installs it with a fixed
+recipe (mise/node via the declared mise tool; pipx/cargo via apt; yarn/pnpm via
+corepack with an npm-global fallback), then the normal `packages` step can
+install dependents. `apply` itself stays noninteractive. Project-level installs
+are detected from lockfiles into `[[project_deps]]` and deliberately start as
+skipped TUI actions (`node_deps`, `cargo_deps`); each one loops over projects and
+asks “install / skip”. They can also be rerun directly with
+`vpsclone install-node-deps` or `vpsclone install-cargo-deps`. Fixed recipes are
+used for every install command; free-form commands are never read from the
+descriptor.
 
 **Dotfiles.** `audit` looks for an expanded allowlist: the original shell, git,
 mise, OpenCode and herdr configs plus common files such as `.inputrc`,
@@ -185,10 +201,16 @@ human steps. Press `a` in the TUI to open the Actions pane:
 - `guided_subprocess` — suspends curses and runs a known command in a real
   terminal, e.g. `vpsclone keygen` or `vault-unpack`; passphrases stay inside
   the child process
+- `toolchain` — asks before installing any manager required by the manifest
+  (`mise`, `node`/`npm`, `pipx`, `cargo`, `yarn`, `pnpm`)
+- `project_deps` — starts `SKIPPED`; re-detect Node/Rust projects after repos
+  are cloned, then asks per project “install / skip” (`node_deps`, `cargo_deps`)
 
-Commands are built from fixed `command_id` values in the engine, never executed
-straight from the descriptor. After an action runs, its declared check is
-re-evaluated and the result shown before you continue.
+Commands are built from fixed `command_id` values or validated detected
+metadata in the engine, never executed straight from the descriptor. After an
+action runs, its declared check is re-evaluated and the result shown before you
+continue. The project actions can be re-triggered later from the Actions pane
+or via `vpsclone install-node-deps` / `vpsclone install-cargo-deps`.
 
 Every `[[binaries]]` entry with an empty `install` field also becomes a
 `prompt_value` action (e.g. `binary_install_1_opencode`). With `--tui`, those

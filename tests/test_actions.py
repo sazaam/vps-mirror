@@ -23,15 +23,17 @@ class ActionTests(unittest.TestCase):
         actions = vpsclone.default_action_defs()
         ids = [a["id"] for a in actions]
         self.assertEqual(ids, [
-            "provider_snapshot", "github_deploy_key", "data_paths",
-            "allow_symlinks", "github_key_check", "ssh_prepare", "fresh_login",
-            "ssh_commit", "data_destination", "data_sync_dry", "data_sync_live",
+            "provider_snapshot", "toolchain", "node_deps", "cargo_deps",
+            "github_deploy_key", "data_paths", "allow_symlinks",
+            "github_key_check", "ssh_prepare", "fresh_login", "ssh_commit",
+            "data_destination", "data_sync_dry", "data_sync_live",
             "vault_unpack", "save_session",
         ])
         for a in actions:
             self.assertIn(a["kind"],
                           {"acknowledge", "prompt_value", "prompt_bool",
-                           "guided_subprocess", "save_session"})
+                           "guided_subprocess", "toolchain", "project_deps",
+                           "save_session"})
 
     def test_set_manifest_value_splits_data_paths(self):
         m = {"data": {"paths": []}}

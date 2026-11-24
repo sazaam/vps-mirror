@@ -576,6 +576,47 @@ def _dedupe_records(records: list[dict]) -> list[dict]:
     return out
 
 
+# ------------------------------------------------------------ tool resolution
+_TOOL_CACHE: dict[tuple[str, str, bool], list[str] | None] = {}
+
+
+def _tool_prefix(tool: str, home: str, prefer_mise: bool) -> list[str] | None:
+    """Return the argv prefix that can run *tool*, preferring mise when asked."""
+    key = (tool, home, prefer_mise)
+    if key in _TOOL_CACHE:
+        return _TOOL_CACHE[key]
+    env = {"HOME": home}
+    mise_prefix = ["mise", "exec", "--"] if shutil.which("mise") else None
+    if prefer_mise and mise_prefix:
+        rc, _ = cmd([*mise_prefix, tool, "--version"], quiet=True, env=env)
+        if rc == 0:
+            _TOOL_CACHE[key] = mise_prefix
+            return mise_prefix
+    if shutil.which(tool):
+        _TOOL_CACHE[key] = []
+        return []
+    if mise_prefix:
+        rc, _ = cmd([*mise_prefix, tool, "--version"], quiet=True, env=env)
+        if rc == 0:
+            _TOOL_CACHE[key] = mise_prefix
+            return mise_prefix
+    _TOOL_CACHE[key] = None
+    return None
+
+
+def tool_argv(tool: str, subargs: list[str], home: str,
+              prefer_mise: bool = False) -> list[str]:
+    """Build a command for *tool*, falling back to PATH if nothing can run it."""
+    prefix = _tool_prefix(tool, home, prefer_mise)
+    if prefix is None:
+        return [tool, *subargs]
+    return [*prefix, tool, *subargs]
+
+
+def tool_available(tool: str, home: str, prefer_mise: bool = False) -> bool:
+    return _tool_prefix(tool, home, prefer_mise) is not None
+
+
 def inv_apt(log_dir: Path = Path("/var/log/installer")):
     rc, out = cmd(["apt-mark", "showmanual"], quiet=True)
     raw = sorted(x.strip() for x in out.splitlines() if x.strip()) if rc == 0 else []
@@ -598,7 +639,8 @@ def inv_apt(log_dir: Path = Path("/var/log/installer")):
 
 def _npm_global_deps(home: str) -> dict | None:
     """Return the raw `npm ls -g --json` dependency map, or None if unusable."""
-    rc, out = cmd(["npm", "ls", "-g", "--json", "--depth=0"],
+    rc, out = cmd(tool_argv("npm", ["ls", "-g", "--json", "--depth=0"], home,
+                            prefer_mise=True),
                   quiet=True, env={"HOME": home})
     if rc or not out.strip():
         return None
@@ -625,7 +667,8 @@ def inv_npm(home: str):
                             "version": str(version) if version else ""})
         notes.append("npm names from `npm ls -g --json`")
     else:
-        rc, out = cmd(["npm", "ls", "-g", "--depth=0", "--parseable"],
+        rc, out = cmd(tool_argv("npm", ["ls", "-g", "--depth=0", "--parseable"],
+                                home, prefer_mise=True),
                       quiet=True, env={"HOME": home})
         if rc == 0:
             for line in out.splitlines():
@@ -746,8 +789,9 @@ def npm_global_versions(home: str) -> dict[str, str]:
 
 
 def pipx_global_versions(home: str) -> dict[str, str]:
-    rc, out = cmd(["pipx", "list", "--short"], quiet=True,
-                  env={"HOME": home})
+    rc, out = cmd(tool_argv("pipx", ["list", "--short"], home,
+                            prefer_mise=True),
+                  quiet=True, env={"HOME": home})
     if rc:
         return {}
     out_map = {}
@@ -764,8 +808,9 @@ def pipx_global_versions(home: str) -> dict[str, str]:
 
 
 def cargo_global_versions(home: str) -> dict[str, str]:
-    rc, out = cmd(["cargo", "install", "--list"], quiet=True,
-                  env={"HOME": home})
+    rc, out = cmd(tool_argv("cargo", ["install", "--list"], home,
+                            prefer_mise=True),
+                  quiet=True, env={"HOME": home})
     if rc:
         return {}
     out_map = {}
@@ -983,6 +1028,74 @@ def detect_repos(home: str) -> list[dict]:
             "commit": sha.strip() if rc3 == 0 else "",
         })
     return sorted(repos, key=lambda r: r["path"])
+
+
+PROJECT_MARKERS = (
+    ("pnpm-lock.yaml", "node", "pnpm"),
+    ("yarn.lock", "node", "yarn"),
+    ("package-lock.json", "node", "npm"),
+    ("package.json", "node", "npm"),
+    ("Cargo.toml", "rust", "cargo"),
+)
+
+
+def detect_project_deps(home: str, repos: list[dict]) -> list[dict]:
+    """Record per-repo dependency managers detected from lockfiles/manifests."""
+    root = Path(home)
+    found = []
+    for repo in repos:
+        rel = str(repo.get("path", ""))
+        if not rel.startswith("~/"):
+            continue
+        path = root / rel[2:]
+        if not path.is_dir():
+            continue
+        kind = manager = lockfile = ""
+        for marker, marker_kind, marker_manager in PROJECT_MARKERS:
+            if (path / marker).is_file():
+                kind, manager = marker_kind, marker_manager
+                if marker == "Cargo.toml":
+                    lockfile = "Cargo.lock" if (path / "Cargo.lock").is_file() else ""
+                else:
+                    lockfile = marker
+                break
+        if kind:
+            found.append({
+                "repo": rel,
+                "kind": kind,
+                "manager": manager,
+                "lockfile": lockfile,
+            })
+    return sorted(found, key=lambda d: d["repo"])
+
+
+def project_path(dep: dict, home: str) -> Path | None:
+    rel = str(dep.get("repo", ""))
+    if not rel.startswith("~/") or "\n" in rel:
+        return None
+    return Path(home) / rel[2:]
+
+
+def project_install_argv(dep: dict, home: str) -> list[str] | None:
+    """Build a validated per-project install command from detected metadata."""
+    manager = str(dep.get("manager", ""))
+    lockfile = str(dep.get("lockfile", ""))
+    rel = str(dep.get("repo", ""))
+    if not rel.startswith("~/") or "\n" in rel:
+        return None
+    if manager == "npm":
+        subargs = ["ci"] if lockfile == "package-lock.json" else ["install"]
+    elif manager == "yarn":
+        subargs = (["install", "--frozen-lockfile"] if lockfile == "yarn.lock"
+                   else ["install"])
+    elif manager == "pnpm":
+        subargs = (["install", "--frozen-lockfile"]
+                   if lockfile == "pnpm-lock.yaml" else ["install"])
+    elif manager == "cargo":
+        subargs = ["build", "--locked"] if lockfile == "Cargo.lock" else ["build"]
+    else:
+        return None
+    return tool_argv(manager, subargs, home, prefer_mise=True)
 
 
 def detect_binaries(home: str) -> list[dict]:
@@ -1439,6 +1552,7 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
     except KeyError:
         primary = user
     sudo_group = "sudo" if in_group(user, "sudo") else ""
+    repos = detect_repos(home)
 
     data = {
         "meta": {
@@ -1475,7 +1589,8 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
         "fail2ban": {"enable": True},
         "packages": packages,
         "services": {"enable": enabled_services()},
-        "repos": detect_repos(home),
+        "repos": repos,
+        "project_deps": detect_project_deps(home, repos),
         "binaries": detect_binaries(home),
         "data": {"paths": [], "exclude": []},
         "cloud": {"preserve_hostname": True, "manage_etc_hosts": False},
@@ -1554,7 +1669,9 @@ def write_capture_report(data: dict, copied: list[str],
         f"dotfiles: {len(data['dotfiles'])}   "
         f"symlinks: {len(data.get('dotfile_symlinks', {}))}   "
         f"system files: {len(data['system_files'])}",
-        f"git repos: {len(data['repos'])}   external binaries: {len(data['binaries'])}",
+        f"git repos: {len(data['repos'])}   "
+        f"project deps: {len(data.get('project_deps', []))}   "
+        f"external binaries: {len(data['binaries'])}",
         "",
         "Ship list (captured into bundle):",
         *[f"  + {c}" for c in copied],
@@ -1596,7 +1713,7 @@ def op_capture(args) -> None:
 
 # ---------------------------------------------------------------- audit / drive
 TASK_LADDER = [
-    "preflight", "accounts", "packages", "firewall", "ssh", "system",
+    "preflight", "toolchain", "accounts", "packages", "firewall", "ssh", "system",
     "services", "dotfiles", "deploy_key", "repos", "vault", "apps",
     "data", "verify",
 ]
@@ -1610,6 +1727,7 @@ def default_task_defs() -> dict:
     """
     return {
         "preflight": {"criticality": "critical", "run": "doctor"},
+        "toolchain": {"criticality": "critical", "run": "toolchain"},
         "accounts": {"criticality": "critical",
                      "run": "apply --only=hooks,users"},
         "packages": {"criticality": "critical",
@@ -1637,8 +1755,9 @@ def default_task_defs() -> dict:
 def default_action_defs() -> list[dict]:
     """Guided fixes for gaps a human still has to close.
 
-    Only fixed action kinds are honoured by the TUI; commands are built from
-    `command_id`, never executed straight from the descriptor.
+    Only fixed action kinds are honoured by the TUI; commands come from
+    validated `command_id`s or detected project metadata, never raw descriptor
+    strings.
     """
     return [
         {
@@ -1647,6 +1766,30 @@ def default_action_defs() -> list[dict]:
             "title": "Provider snapshot",
             "message": "Take a provider snapshot before apply, then press Enter.",
             "why": "Cannot be automated without cloud credentials.",
+        },
+        {
+            "id": "toolchain",
+            "kind": "toolchain",
+            "title": "Ensure required toolchain",
+            "why": "Reads the manifest, installs missing managers, then "
+                   "dependent package installs can proceed.",
+            "check_task": "toolchain",
+        },
+        {
+            "id": "node_deps",
+            "kind": "project_deps",
+            "title": "Install Node project dependencies",
+            "groups": ["node"],
+            "initial_state": "SKIPPED",
+            "why": "Re-runnable after repos are cloned; asks per project.",
+        },
+        {
+            "id": "cargo_deps",
+            "kind": "project_deps",
+            "title": "Install Rust project dependencies",
+            "groups": ["rust"],
+            "initial_state": "SKIPPED",
+            "why": "Re-runnable after repos are cloned; asks per project.",
         },
         {
             "id": "github_deploy_key",
@@ -2197,6 +2340,11 @@ def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]
             if u.get("sudo_group"):
                 ck(f"sudo:{u['name']}", in_group(u["name"], u["sudo_group"]))
 
+    elif name == "toolchain":
+        home = str(m.get("target", {}).get("home") or invoking_home())
+        for tool_name in required_managers(m):
+            ck(f"tool:{tool_name}", manager_available(tool_name, m, home))
+
     elif name == "packages":
         for pkg in ("ufw", "fail2ban", "openssh-server", "zsh"):
             ck(f"dpkg:{pkg}", _pkg_installed(pkg))
@@ -2231,6 +2379,9 @@ def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]
 
 def _tui_dispatch(run: str, m: dict, dry: bool) -> tuple[int, bool]:
     for part in [p.strip() for p in run.split(";") if p.strip()]:
+        if part == "toolchain":
+            log("MANUAL: run the 'toolchain' guided action to install managers")
+            return 0, True
         if part == "doctor":
             rc = op_doctor(argparse.Namespace())
         elif part == "verify":
@@ -2341,11 +2492,18 @@ def _set_manifest_value(m: dict, target: str, value: str) -> bool:
     return True
 
 
-def _tui_run_child(argv: list[str]) -> int:
+def _tui_run_child(argv: list[str], *, cwd: Path | str | None = None,
+                   env: dict | None = None, as_user: str | None = None) -> int:
     _TUI_CURSES.endwin()
+    argv = [str(a) for a in argv]
+    if as_user and os.geteuid() == 0 and as_user != "root":
+        argv = ["runuser", "-u", as_user, "--", *argv]
     print("\n$ " + shlex.join(argv), flush=True)
+    child_env = dict(os.environ)
+    if env:
+        child_env.update({str(k): str(v) for k, v in env.items()})
     try:
-        rc = subprocess.run(argv, cwd=str(REPO)).returncode
+        rc = subprocess.run(argv, cwd=str(cwd or REPO), env=child_env).returncode
     except Exception as exc:
         print(f"[ERROR] {type(exc).__name__}: {exc}", flush=True)
         rc = 1
@@ -2354,6 +2512,108 @@ def _tui_run_child(argv: list[str]) -> int:
     except EOFError:
         pass
     return rc
+
+
+def _tui_toolchain(stdscr, m: dict, dry: bool) -> tuple[int, bool, list]:
+    home = str(m.get("target", {}).get("home") or invoking_home())
+    checks: list[tuple[str, str, str]] = []
+    manual = False
+    rc = 0
+    for name in required_managers(m):
+        if manager_available(name, m, home):
+            checks.append((f"tool:{name}", "PASS", "available"))
+            continue
+        steps = manager_install_steps(name, m, home)
+        lines = [f"{name} is required by the manifest.", ""]
+        lines += [shlex.join(str(a) for a in s["argv"]) for s in steps]
+        lines += ["", "Enter=install   n=skip   s=skip all   q=quit"]
+        ans = _tui_modal(stdscr, f"TOOLCHAIN - {name}", lines, allow_no=True)
+        if ans in ("skip", "quit", "no"):
+            checks.append((f"tool:{name}", "WARN", "skipped by user"))
+            rc = 1
+            if ans == "quit":
+                manual = True
+                break
+            continue
+        if dry:
+            checks.append((f"tool:{name}", "SKIP", "dry-run"))
+            continue
+        failed = False
+        for step in steps:
+            step_rc = _tui_run_child(step["argv"], env=step.get("env"),
+                                     as_user=step.get("as_user"))
+            if step_rc:
+                failed = True
+                break
+        ok = (not failed) and manager_available(name, m, home)
+        checks.append((f"tool:{name}", "PASS" if ok else "FAIL",
+                       "ready" if ok else "install failed"))
+        if not ok:
+            rc = 1
+    return rc, manual, checks
+
+
+def _tui_project_deps(stdscr, action: dict, m: dict, dry: bool
+                      ) -> tuple[list, int, bool]:
+    home = str(m.get("target", {}).get("home") or invoking_home())
+    user = str(m.get("target", {}).get("user", ""))
+    env = {"HOME": home}
+    groups = set(action.get("groups", []) or [])
+    deps = [d for d in refresh_project_deps(m)
+            if str(d.get("kind", "")) in groups]
+    checks: list[tuple[str, str, str]] = []
+    rc = 0
+    if not deps:
+        return [("project_deps", "WARN",
+                 f"no {','.join(sorted(groups))} projects detected")], 0, False
+    for dep in deps:
+        repo = str(dep.get("repo", ""))
+        path = project_path(dep, home)
+        argv = project_install_argv(dep, home)
+        if not path or not path.is_dir() or not argv:
+            checks.append((f"project:{repo}", "WARN",
+                           "not present on this box"))
+            continue
+        manager = str(dep.get("manager", ""))
+        if manager and not manager_available(manager, m, home):
+            steps = manager_install_steps(manager, m, home)
+            lines = [f"{manager} is required for {repo}.", ""]
+            lines += [shlex.join(str(a) for a in s["argv"]) for s in steps]
+            lines += ["", "Enter=install   n=skip project   s=skip all   q=quit"]
+            ans = _tui_modal(stdscr, f"TOOLCHAIN - {manager}", lines,
+                             allow_no=True)
+            if ans in ("quit", "skip", "no"):
+                checks.append((f"tool:{manager}", "WARN", "skipped by user"))
+                rc = 1
+                if ans == "quit":
+                    return checks, rc, True
+                continue
+            for step in steps:
+                if _tui_run_child(step["argv"], env=step.get("env"),
+                                  as_user=step.get("as_user")):
+                    checks.append((f"tool:{manager}", "FAIL", "install failed"))
+                    rc = 1
+                    break
+        if dry:
+            checks.append((f"project:{repo}", "SKIP", "dry-run"))
+            continue
+        ans = _tui_modal(stdscr, f"PROJECT DEPS - {repo}", [
+            str(action.get("why", "")), "",
+            "This will run:", "  " + shlex.join(str(a) for a in argv), "",
+            "Enter=install   n=skip   s=skip all   q=quit",
+        ], allow_no=True)
+        if ans in ("quit", "skip", "no"):
+            checks.append((f"project:{repo}", "WARN", "skipped by user"))
+            if ans == "quit":
+                return checks, rc, True
+            continue
+        step_rc = _tui_run_child(argv, cwd=path, env=env, as_user=user)
+        ok = step_rc == 0
+        checks.append((f"project:{repo}", "PASS" if ok else "FAIL",
+                       "ok" if ok else f"exit={step_rc}"))
+        if not ok:
+            rc = 1
+    return checks, rc, False
 
 
 def _tui_run_action(stdscr, action: dict, m: dict, dry: bool
@@ -2391,6 +2651,16 @@ def _tui_run_action(stdscr, action: dict, m: dict, dry: bool
             _tui_modal(stdscr, "INVALID TARGET",
                        [f"cannot store value at {action.get('target')!r}"])
             return "skip", [], rc
+
+    elif kind == "toolchain":
+        rc, _, checks = _tui_toolchain(stdscr, m, dry)
+        return "done", checks, rc
+
+    elif kind == "project_deps":
+        checks, rc, quit_flag = _tui_project_deps(stdscr, action, m, dry)
+        if quit_flag:
+            return "quit", checks, rc
+        return "done", checks, rc
 
     elif kind == "guided_subprocess":
         argv = _action_argv(action, m)
@@ -2461,7 +2731,8 @@ def run_tui(plan: dict, m: dict) -> int:
     dry = True
     actions = [a for a in plan.get("actions", [])
                if isinstance(a, dict) and a.get("id")]
-    astate = {str(a["id"]): "TODO" for a in actions}
+    astate = {str(a["id"]): str(a.get("initial_state", "TODO"))
+              for a in actions}
     aselected = 0
     view = "tasks"
 
@@ -2560,9 +2831,14 @@ def run_tui(plan: dict, m: dict) -> int:
             manual = False
             try:
                 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                    rc, manual = _tui_dispatch(str(specs[name].get("run", "")), m, dry)
-                    if not manual:
-                        results[name] = _tui_check_task(name, m, dry)
+                    if name == "toolchain":
+                        rc, manual, checks = _tui_toolchain(stdscr, m, dry)
+                        results[name] = checks
+                    else:
+                        rc, manual = _tui_dispatch(
+                            str(specs[name].get("run", "")), m, dry)
+                        if not manual:
+                            results[name] = _tui_check_task(name, m, dry)
             except BaseException as exc:
                 buf.write(f"[ERROR] {type(exc).__name__}: {exc}\n")
                 rc = 1
@@ -2885,10 +3161,11 @@ def step_packages(m, dry) -> None:
     if npm_specs:
         if dry:
             log(f"npm: would install {len(npm_specs)} pinned global package(s)")
-        elif not shutil.which("npm"):
+        elif not tool_available("npm", home, prefer_mise=True):
             log("npm not installed, skipping global packages", "WARN")
         else:
-            rc, out = cmd(["npm", "install", "-g", "--", *npm_specs],
+            rc, out = cmd(tool_argv("npm", ["install", "-g", "--", *npm_specs],
+                                    home, prefer_mise=True),
                           as_user=user, env=env, check=False)
             log(f"npm global packages: {'ok' if rc == 0 else 'FAILED'} {out.strip()[:120]}",
                 "INFO" if rc == 0 else "WARN")
@@ -2897,7 +3174,7 @@ def step_packages(m, dry) -> None:
     if pipx_want:
         if dry:
             log(f"pipx: would install {len(pipx_want)} pinned tool(s)")
-        elif not shutil.which("pipx"):
+        elif not tool_available("pipx", home, prefer_mise=True):
             log("pipx not installed, skipping tools", "WARN")
         else:
             failed = []
@@ -2906,7 +3183,9 @@ def step_packages(m, dry) -> None:
                 if spec.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.+=-]+", spec):
                     log(f"pipx: unsafe spec skipped: {spec!r}", "WARN")
                     continue
-                rc, out = cmd(["pipx", "install", spec], as_user=user, env=env, check=False)
+                rc, out = cmd(tool_argv("pipx", ["install", spec], home,
+                                        prefer_mise=True),
+                              as_user=user, env=env, check=False)
                 if rc:
                     failed.append(f"{spec}: {out.strip().splitlines()[-1] if out.strip() else 'failed'}")
             log(f"pipx tools: {'ok' if not failed else 'FAILED'} {'; '.join(failed)[:160]}",
@@ -2922,15 +3201,16 @@ def step_packages(m, dry) -> None:
     if safe_cargo:
         if dry:
             log(f"cargo: would install {len(safe_cargo)} pinned crate(s)")
-        elif not shutil.which("cargo"):
+        elif not tool_available("cargo", home, prefer_mise=True):
             log("cargo not installed, skipping crate installs", "WARN")
         else:
             failed = []
             for name, ver in safe_cargo:
-                argv = ["cargo", "install", name]
+                subargs = ["install", name]
                 if ver and re.fullmatch(r"[0-9A-Za-z_.+-]+", ver):
-                    argv += ["--version", ver]
-                rc, out = cmd(argv, as_user=user, env=env, check=False)
+                    subargs += ["--version", ver]
+                rc, out = cmd(tool_argv("cargo", subargs, home, prefer_mise=True),
+                              as_user=user, env=env, check=False)
                 if rc:
                     failed.append(f"{name}@{ver or 'latest'}: "
                                   f"{out.strip().splitlines()[-1] if out.strip() else 'failed'}")
@@ -3523,6 +3803,209 @@ def run_hook(path: str, dry: bool) -> None:
 
 def step_hooks(m, dry) -> None:
     run_hook(m.get("hooks", {}).get("pre_apply", "hooks/pre-apply.sh"), dry)
+
+
+# ------------------------------------------------- required toolchain / deps
+MANAGER_ORDER = ("mise", "node", "npm", "pipx", "cargo", "yarn", "pnpm")
+
+
+def declared_mise_tools(m: dict) -> list[str]:
+    pkgs = m.get("packages", {}) or {}
+    mise = pkgs.get("mise", {}) or {}
+    return [str(t).strip() for t in (mise.get("tools", []) or [])
+            if str(t).strip()]
+
+
+def required_managers(m: dict) -> list[str]:
+    """Read the manifest first: which managers must exist before replay?"""
+    req: set[str] = set()
+    pkgs = m.get("packages", {}) or {}
+    for rec in pkgs.get("records", []) or []:
+        installer = str(rec.get("installer", ""))
+        if installer in ("npm", "pipx", "cargo"):
+            req.add(installer)
+    tools = declared_mise_tools(m)
+    if tools:
+        req.add("mise")
+    if any(t.startswith("node@") for t in tools):
+        req.add("node")
+    for dep in m.get("project_deps", []) or []:
+        manager = str(dep.get("manager", ""))
+        if manager in ("npm", "yarn", "pnpm", "cargo"):
+            req.add(manager)
+    return [name for name in MANAGER_ORDER if name in req]
+
+
+def manager_available(name: str, m: dict, home: str) -> bool:
+    if name == "mise":
+        return shutil.which("mise") is not None
+    if name in ("node", "npm"):
+        return tool_available("npm", home, prefer_mise=True)
+    if name in ("yarn", "pnpm"):
+        return (tool_available(name, home, prefer_mise=True)
+                or tool_available("corepack", home, prefer_mise=True))
+    return tool_available(name, home, prefer_mise=True)
+
+
+def manager_install_steps(name: str, m: dict, home: str) -> list[dict]:
+    """Fixed, validated recipes. No free-form commands are read from the manifest."""
+    user = str(m.get("target", {}).get("user", ""))
+    env = {"HOME": home}
+    apt_env = {"DEBIAN_FRONTEND": "noninteractive"}
+    if name == "mise":
+        return [{"label": "apt-get install -y mise",
+                 "argv": ["apt-get", "install", "-y", "mise"], "env": apt_env}]
+    if name in ("node", "npm"):
+        node_spec = next((t for t in declared_mise_tools(m)
+                          if t.startswith("node@")), "")
+        if node_spec:
+            return [{"label": f"mise install {node_spec}",
+                     "argv": ["mise", "install", node_spec],
+                     "as_user": user, "env": env}]
+        return [{"label": "apt-get install -y npm",
+                 "argv": ["apt-get", "install", "-y", "npm"], "env": apt_env}]
+    if name in ("pipx", "cargo"):
+        return [{"label": f"apt-get install -y {name}",
+                 "argv": ["apt-get", "install", "-y", name], "env": apt_env}]
+    if name in ("yarn", "pnpm"):
+        if tool_available("corepack", home, prefer_mise=True):
+            return [
+                {"label": "corepack enable",
+                 "argv": tool_argv("corepack", ["enable"], home, True),
+                 "as_user": user, "env": env},
+                {"label": f"corepack prepare {name}@stable --activate",
+                 "argv": tool_argv("corepack",
+                                   ["prepare", f"{name}@stable", "--activate"],
+                                   home, True),
+                 "as_user": user, "env": env},
+            ]
+        return [{"label": f"npm install -g {name}",
+                 "argv": tool_argv("npm", ["install", "-g", name], home, True),
+                 "as_user": user, "env": env}]
+    return []
+
+
+def _confirm(message: str, assume_yes: bool = False) -> bool:
+    if assume_yes:
+        return True
+    try:
+        answer = input(f"{message} [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
+def _run_install_steps(name: str, steps: list[dict]) -> bool:
+    for step in steps:
+        log(f"toolchain: {step['label']}")
+        rc, out = cmd(step["argv"], as_user=step.get("as_user"),
+                      env=step.get("env"), check=False)
+        if rc:
+            log(f"toolchain: {name} FAILED: {out.strip()[:160]}", "WARN")
+            return False
+    return True
+
+
+def op_ensure_toolchain(args) -> int:
+    m = getattr(args, "manifest_obj", None) or load_manifest()
+    home = str(m.get("target", {}).get("home") or invoking_home())
+    assume_yes = bool(getattr(args, "yes", False))
+    names = required_managers(m)
+    log(f"toolchain required: {', '.join(names) if names else '(none)'}")
+    missing = []
+    for name in names:
+        if manager_available(name, m, home):
+            log(f"toolchain: {name} available")
+            continue
+        steps = manager_install_steps(name, m, home)
+        if not steps:
+            log(f"toolchain: no safe recipe for {name}", "WARN")
+            missing.append(name)
+            continue
+        print(f"\n{name} is required by the manifest. Recipe:")
+        for step in steps:
+            print("  " + shlex.join(str(a) for a in step["argv"]))
+        if not _confirm(f"Install {name}?", assume_yes):
+            log(f"toolchain: {name} skipped by user", "WARN")
+            missing.append(name)
+            continue
+        if not _run_install_steps(name, steps):
+            missing.append(name)
+            continue
+        if not manager_available(name, m, home):
+            log(f"toolchain: {name} still unavailable after install", "WARN")
+            missing.append(name)
+        else:
+            log(f"toolchain: {name} installed")
+    if missing:
+        log(f"toolchain incomplete: {', '.join(missing)}", "ERROR")
+        return 1
+    log("toolchain ready; dependent installs may proceed")
+    return 0
+
+
+def refresh_project_deps(m: dict) -> list[dict]:
+    """Re-detect project types on this box after repos are cloned."""
+    home = str(m.get("target", {}).get("home") or invoking_home())
+    detected = detect_project_deps(home, m.get("repos", []) or [])
+    if detected:
+        m["project_deps"] = detected
+    return list(m.get("project_deps", []) or [])
+
+
+def install_project_deps(m: dict, kinds: tuple[str, ...],
+                         assume_yes: bool = False) -> int:
+    home = str(m.get("target", {}).get("home") or invoking_home())
+    user = str(m.get("target", {}).get("user", ""))
+    env = {"HOME": home}
+    deps = [d for d in refresh_project_deps(m)
+            if str(d.get("kind", "")) in kinds]
+    if not deps:
+        log(f"project deps: no {','.join(kinds)} projects detected")
+        return 0
+    failed = 0
+    for dep in deps:
+        repo = str(dep.get("repo", ""))
+        path = project_path(dep, home)
+        argv = project_install_argv(dep, home)
+        if not path or not path.is_dir() or not argv:
+            log(f"project deps: {repo} unavailable on this box, skipping", "WARN")
+            continue
+        manager = str(dep.get("manager", ""))
+        if manager and not manager_available(manager, m, home):
+            steps = manager_install_steps(manager, m, home)
+            print(f"\n{manager} is required for {repo}. Recipe:")
+            for step in steps:
+                print("  " + shlex.join(str(a) for a in step["argv"]))
+            if not steps or not _confirm(f"Install {manager}?", assume_yes):
+                log(f"project deps: {manager} unavailable for {repo}, skipping",
+                    "WARN")
+                failed += 1
+                continue
+            if not _run_install_steps(manager, steps):
+                failed += 1
+                continue
+        if not _confirm(f"Install dependencies in {repo} ({shlex.join(argv)})?",
+                        assume_yes):
+            log(f"project deps: {repo} skipped by user")
+            continue
+        log(f"project deps: {repo} -> {shlex.join(argv)}")
+        rc, out = cmd(argv, cwd=str(path), as_user=user, env=env, check=False)
+        log(f"project deps: {repo} {'ok' if rc == 0 else 'FAILED'} "
+            f"{out.strip()[:160]}", "INFO" if rc == 0 else "WARN")
+        if rc:
+            failed += 1
+    return 1 if failed else 0
+
+
+def op_install_node_deps(args) -> int:
+    m = getattr(args, "manifest_obj", None) or load_manifest()
+    return install_project_deps(m, ("node",), bool(getattr(args, "yes", False)))
+
+
+def op_install_cargo_deps(args) -> int:
+    m = getattr(args, "manifest_obj", None) or load_manifest()
+    return install_project_deps(m, ("rust",), bool(getattr(args, "yes", False)))
 
 
 STEP_ORDER = ["hooks", "packages", "users", "binaries", "dotfiles", "system",
@@ -4441,6 +4924,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("verify", help="post-apply health checks")
     c.set_defaults(func=op_verify)
+
+    c = sub.add_parser("toolchain",
+                       help="install managers required by the manifest")
+    c.add_argument("--yes", action="store_true",
+                   help="accept every install recipe without prompting")
+    c.set_defaults(func=op_ensure_toolchain)
+
+    c = sub.add_parser("install-node-deps",
+                       help="ask per Node project, then install dependencies")
+    c.add_argument("--yes", action="store_true",
+                   help="accept every project without prompting")
+    c.set_defaults(func=op_install_node_deps)
+
+    c = sub.add_parser("install-cargo-deps",
+                       help="ask per Rust project, then build dependencies")
+    c.add_argument("--yes", action="store_true",
+                   help="accept every project without prompting")
+    c.set_defaults(func=op_install_cargo_deps)
 
     c = sub.add_parser("ssh-cutover-prepare",
                        help="stage dual-port sshd config; keep old port live")
