@@ -1,6 +1,7 @@
 # A-List — VPS mirror pain reduction
 
-These are all active priorities. We work top-down but do not drop later items.
+All items below are complete. This list is kept as a record of what the tool
+was deliberately taught to do.
 
 - [x] **1. Honest, version-aware convergence checks**
   - Pin and verify npm/cargo/mise versions, not just names.
@@ -11,7 +12,7 @@ These are all active priorities. We work top-down but do not drop later items.
 - [x] **2. Content-level secret scanning at capture**
   - Scan allowlisted captured files for tokens/passwords/private keys.
   - Quarantine suspicious files instead of bundling them.
-  - Add a reviewable ship-list to `reports/audit-report.txt`.
+  - Add a reviewable ship-list to `reports/capture-report.txt`.
 
 - [x] **3. Convert the manual tail into first-class actions**
   - Deploy-key verification, extra-user `authorized_keys`, data sync, vault, fresh-login probe.
@@ -28,3 +29,11 @@ These are all active priorities. We work top-down but do not drop later items.
 - [x] **6. Dotfile discovery and opt-in symlinks**
   - Look for common shell/editor/tool dotfiles beyond the original small allowlist.
   - Capture in-home symlinks safely; TUI `allow_symlinks` prompt recreates them or writes plain files.
+
+- [x] **7. Visible skips and captured ownership**
+  - Permission-denied captures are audit gaps with per-file reasons in `audit-report.txt`.
+  - Source `uid:gid` is preserved locally under root and replayed as user:group on the target.
+
+- [x] **8. Clean Git worktree**
+  - Only code and docs remain in the repo; all captured data, reports, bundles, vault and rollback state live in `~/.vps-data`.
+  - `~/.vps-data` resolves to the invoking user's home even under `sudo`, and is chowned back to that user after root audits.

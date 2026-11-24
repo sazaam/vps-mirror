@@ -1,57 +1,15 @@
-# vpsclone capture/bundle denylist
-# Anything matching a pattern here is NEVER copied into the repo or bundle.
-# fnmatch globs; basename is matched too.
+# vpsclone capture/bundle denylist (local additions)
+# Built-in rules already deny service.json, credentials, *.pem/*.key, SSH
+# material except safe artifacts, history/cache noise, and vault/secrets/*.gpg.
+# Add only extra patterns needed on this machine; negations are honored.
 
-# Secrets / credentials
-*service.json
-*service.json.*
-*credentials*
-*.netrc
-*.npmrc
-*.pypirc
-*.pem
-*.key
 *.p12
 *.pfx
-*id_rsa*
-*id_ed25519*
-# Deny all SSH material by default, then explicitly re-allow the only safe
-# artifacts. Negations are honored by vpsclone's is_denied().
-*/.ssh/*
-.ssh/*
-ssh/*
-!*/.ssh/config
-!*/.ssh/authorized_keys
-!*/.ssh/*.pub
-!.ssh/config
-!.ssh/authorized_keys
-!.ssh/*.pub
-!ssh/authorized_keys
-!ssh/*.pub
-!ssh/sshd_hardening.conf
-*.gpg
-*.age
-vault/
-secrets/
-.vault/
-
-# History / caches / generated noise
-*zsh_history
-*.histfile
+*service.json.*
 *bash_history
-*zcompdump*
-*.zwc
-*known_hosts*
-*/.cache/*
-*node_modules/*
-*.log
 *.pid
 *.sock
-*.bak*
-*.old
 *~
-
-# Local state that should not define a fresh machine
 *.sqlite
 *.db
 *.swp

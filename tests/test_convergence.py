@@ -31,6 +31,16 @@ class FakeRunner:
         return self.responses.get(key, (127, ""))
 
 
+@contextlib.contextmanager
+def fake_cmd(responses: dict[str, tuple[int, str]]):
+    original = vpsclone.cmd
+    vpsclone.cmd = FakeRunner(responses)
+    try:
+        yield
+    finally:
+        vpsclone.cmd = original
+
+
 def base_manifest() -> dict:
     return {
         "target": {"user": getpass.getuser(), "home": "/home/fixture",
@@ -47,15 +57,13 @@ def base_manifest() -> dict:
 
 
 class ConvergenceTests(unittest.TestCase):
-    def test_expected_versions_prefers_records_and_skips_nonreplayable_cargo(self):
+    def test_expected_versions_uses_records_only(self):
         m = base_manifest()
         m["packages"] = {
-            "npm": ["a", "b"],
+            "npm": ["a", "b"],  # legacy name-only list is ignored
             "records": [
                 {"installer": "npm", "name": "a", "version": "1.2.3"},
                 {"installer": "cargo", "name": "ripgrep", "version": "14.0.0"},
-                {"installer": "cargo", "name": "proxy", "version": "0.1",
-                 "replayable": False},
             ],
         }
         self.assertEqual(vpsclone.expected_versions(m, "npm"), {"a": "1.2.3"})
@@ -64,18 +72,18 @@ class ConvergenceTests(unittest.TestCase):
         self.assertEqual(vpsclone.expected_versions(m, "pipx"), {})
 
     def test_npm_global_versions_parses_scoped_packages(self):
-        runner = FakeRunner({
+        with fake_cmd({
             "npm ls -g --json --depth=0": (0, json.dumps({
                 "dependencies": {
                     "opencode": {"version": "1.2.3"},
                     "@scope/tool": {"version": "2.0.0"},
                 }
             })),
-        })
-        self.assertEqual(
-            vpsclone.npm_global_versions("/home/fixture", runner=runner),
-            {"opencode": "1.2.3", "@scope/tool": "2.0.0"},
-        )
+        }):
+            self.assertEqual(
+                vpsclone.npm_global_versions("/home/fixture"),
+                {"opencode": "1.2.3", "@scope/tool": "2.0.0"},
+            )
 
     def test_convergence_flags_version_and_commit_drift(self):
         m = base_manifest()
@@ -90,7 +98,7 @@ class ConvergenceTests(unittest.TestCase):
         m["repos"] = [{"path": "~/proj", "url": "git@github.com:o/r.git",
                        "branch": "main", "commit": "abc1234"}]
 
-        runner = FakeRunner({
+        with fake_cmd({
             "dpkg-query -W -f=${Status} htop": (0, "install ok installed\n"),
             "npm ls -g --json --depth=0": (0, json.dumps({
                 "dependencies": {"opencode": {"version": "9.9.9"}}})),
@@ -104,11 +112,10 @@ class ConvergenceTests(unittest.TestCase):
             "git -C /home/fixture/proj status --porcelain": (0, ""),
             "ss -tulpn": (0, "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"),
             "sshd -t": (0, ""),
-        })
-
-        results = {name: (ok, detail, warn)
-                   for name, ok, detail, warn
-                   in vpsclone.check_convergence(m, runner=runner)}
+        }):
+            results = {name: (ok, detail, warn)
+                       for name, ok, detail, warn
+                       in vpsclone.check_convergence(m)}
 
         self.assertFalse(results["npm:versions"][0])
         self.assertIn("want 1.2.3, got 9.9.9", results["npm:versions"][1])
@@ -118,6 +125,23 @@ class ConvergenceTests(unittest.TestCase):
         self.assertTrue(results["service:ssh"][0])
         self.assertTrue(results["manual:vault"][2])
         self.assertTrue(results["manual:login"][2])
+
+    def test_plan_uses_convergence_results(self):
+        m = base_manifest()
+        m["meta"] = {"schema": 1}
+        m["firewall"] = {"allow": ["2222/tcp"]}
+        m["packages"] = {"apt": []}
+        original_load = vpsclone.load_manifest
+        vpsclone.load_manifest = lambda: m
+        try:
+            with fake_cmd({}), contextlib.redirect_stdout(io.StringIO()) as buf:
+                vpsclone.op_plan(None)
+        finally:
+            vpsclone.load_manifest = original_load
+        out = buf.getvalue()
+        self.assertIn("AREA", out)
+        self.assertIn("open 2222/tcp", out)
+        self.assertIn("binaries", out)
 
     def test_step_packages_uses_pinned_specs(self):
         m = base_manifest()
@@ -140,7 +164,7 @@ class ConvergenceTests(unittest.TestCase):
         vpsclone.shutil.which = lambda name: f"/usr/bin/{name}"
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                vpsclone.step_packages(m, False, None)
+                vpsclone.step_packages(m, False)
         finally:
             vpsclone.cmd = original_cmd
             vpsclone.shutil.which = original_which

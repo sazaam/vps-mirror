@@ -115,32 +115,30 @@ class DotfileTests(unittest.TestCase):
                 "data": {},
             }
 
-            def runner(args, **kwargs):
-                return 0, ":22 "
-
-            originals = (vpsclone.REPO, vpsclone.FINAL_DROPIN,
-                         vpsclone.CUTOVER_DROPIN)
-            vpsclone.REPO = repo
+            originals = (vpsclone.VPS_DATA, vpsclone.FINAL_DROPIN,
+                         vpsclone.CUTOVER_DROPIN, vpsclone.cmd)
+            vpsclone.VPS_DATA = repo
             vpsclone.FINAL_DROPIN = dropin
             vpsclone.CUTOVER_DROPIN = root / "missing-cutover.conf"
+            vpsclone.cmd = lambda args, **kwargs: (0, ":22 ")
             try:
-                out = vpsclone.check_convergence(m, runner=runner)
+                out = vpsclone.check_convergence(m)
                 results = {name: ok for name, ok, _, _ in out}
                 self.assertTrue(results["dotfile:~/.zshrc"])
 
                 link.unlink()
                 link.write_text("plain file\n", encoding="utf-8")
-                out = vpsclone.check_convergence(m, runner=runner)
+                out = vpsclone.check_convergence(m)
                 results = {name: ok for name, ok, _, _ in out}
                 self.assertFalse(results["dotfile:~/.zshrc"])
 
                 m["policy"]["allow_symlinks"] = False
-                out = vpsclone.check_convergence(m, runner=runner)
+                out = vpsclone.check_convergence(m)
                 results = {name: ok for name, ok, _, _ in out}
                 self.assertFalse(results["dotfile:~/.zshrc"])
             finally:
-                (vpsclone.REPO, vpsclone.FINAL_DROPIN,
-                 vpsclone.CUTOVER_DROPIN) = originals
+                (vpsclone.VPS_DATA, vpsclone.FINAL_DROPIN,
+                 vpsclone.CUTOVER_DROPIN, vpsclone.cmd) = originals
 
 
 if __name__ == "__main__":

@@ -58,6 +58,22 @@ fi
 cd "$TARGET"
 chmod +x vpsclone hooks/*.sh 2>/dev/null || true
 
+# Machine-specific data lives outside the repo, owned by the human who ran
+# sudo (or by root when there is no SUDO_USER).
+DATA_USER=${SUDO_USER:-$(id -un)}
+DATA_HOME=$(getent passwd "$DATA_USER" | cut -d: -f6)
+[ -n "$DATA_HOME" ] || DATA_HOME="$HOME"
+DATA_DIR="$DATA_HOME/.vps-data"
+BUNDLE_DATA=$(CDPATH= cd -- "$(dirname -- "$HERE")" && pwd)/vps-mirror-data
+if [ -d "$BUNDLE_DATA" ]; then
+  log "installing data -> $DATA_DIR (owner $DATA_USER)"
+  mkdir -p -- "$DATA_DIR"
+  cp -a -- "$BUNDLE_DATA/." "$DATA_DIR/"
+  chown -R "$DATA_USER:" "$DATA_DIR" || true
+else
+  log "no bundled data; using existing $DATA_DIR"
+fi
+
 log "running preflight"
 python3 vpsclone doctor
 

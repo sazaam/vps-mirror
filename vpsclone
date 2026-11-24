@@ -50,12 +50,25 @@ try:
 except ImportError:
     sys.exit("vpsclone requires Python 3.11+ (tomllib)")
 
+def invoking_home() -> Path:
+    """Home of the human who invoked us, even through sudo."""
+    user = os.environ.get("SUDO_USER")
+    if user and user != "root":
+        try:
+            return Path(pwd.getpwnam(user).pw_dir)
+        except KeyError:
+            pass
+    return Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir).expanduser()
+
+
 REPO = Path(__file__).resolve().parent
-MANIFEST = REPO / "manifest.toml"
+DATA_HOME = invoking_home()
+VPS_DATA = DATA_HOME / ".vps-data"
+MANIFEST = VPS_DATA / "manifest.toml"
 DENYLIST = REPO / "denylist.txt"
 CAPTURE_ALLOW = REPO / "capture-allow.txt"
-REPORTS = REPO / "reports"
-BACKUP_ROOT = Path("/var/backups/vpsclone")
+REPORTS = VPS_DATA / "reports"
+BACKUP_ROOT = VPS_DATA / "backups"
 
 BASE_DOTFILES = [
     ".zshrc", ".p10k.zsh", ".profile", ".bashrc", ".gitconfig", ".vimrc",
@@ -123,7 +136,7 @@ BUILTIN_DENY = [
     "*id_rsa*", "*id_ed25519*", "*/.ssh/*", ".ssh/*", "ssh/*",
     "*zcompdump*", "*.zwc", "*zsh_history", "*.histfile", "*known_hosts*",
     "*/.cache/*", "*.log", "*.bak*", "*.old", "*node_modules/*",
-    "vault/", "secrets/", ".vault/", "*.age", "*.gpg",
+    "vault/", "secrets/", ".vault/", "*.gpg",
 ]
 
 # Negations override earlier deny patterns. Keep the safe SSH artifacts
@@ -330,13 +343,14 @@ def write_bytes_no_symlink(path: Path, data: bytes, *, mode: int | None = None,
         raise
 
 
-def atomic_write_text(path: Path, text: str, *, mode: int = 0o644) -> None:
+def atomic_write_text(path: Path, text: str, *, mode: int = 0o644,
+                      owner: str | None = None) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     try:
         tmp.unlink(missing_ok=True)
-        write_bytes_no_symlink(tmp, text.encode(), mode=mode)
+        write_bytes_no_symlink(tmp, text.encode(), mode=mode, owner=owner)
         os.replace(tmp, path)
     finally:
         try:
@@ -414,10 +428,10 @@ def toml_dump(data: dict) -> str:
 
 # ----------------------------------------------------------- detection
 def os_pretty() -> str:
-    for line in read_text("/etc/os-release").splitlines():
-        if line.startswith("PRETTY_NAME="):
-            return line.split("=", 1)[1].strip().strip('"')
-    return platform.platform()
+    try:
+        return platform.freedesktop_os_release().get("PRETTY_NAME", platform.platform())
+    except OSError:
+        return platform.platform()
 
 
 def detect_timezone() -> str:
@@ -510,10 +524,6 @@ def mise_tools(home: str) -> list[str]:
 # installer/package. Independently implemented here; stdlib only, no code
 # copied. Deliberately limited to installers vpsclone can actually replay.
 INVENTORY_METHOD = "vpsclone-inventory/1"
-CARGO_TOOLCHAIN_BINARIES = {
-    "cargo", "rustc", "rustup", "rustfmt", "cargo-fmt", "clippy-driver",
-    "cargo-clippy", "cargo-install-update", "cargo-install-update-setup",
-}
 _CARGO_LIST_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*)\s+(\S+):\s*$")
 _PIPX_VERSION_RE = re.compile(r"^[0-9A-Za-z_.!+*-]+$")
 
@@ -566,8 +576,8 @@ def _dedupe_records(records: list[dict]) -> list[dict]:
     return out
 
 
-def inv_apt(runner=cmd, log_dir: Path = Path("/var/log/installer")):
-    rc, out = runner(["apt-mark", "showmanual"], quiet=True)
+def inv_apt(log_dir: Path = Path("/var/log/installer")):
+    rc, out = cmd(["apt-mark", "showmanual"], quiet=True)
     raw = sorted(x.strip() for x in out.splitlines() if x.strip()) if rc == 0 else []
     manual = raw
     warnings: list[str] = []
@@ -586,99 +596,71 @@ def inv_apt(runner=cmd, log_dir: Path = Path("/var/log/installer")):
             warnings, notes, {"apt_manual_raw": len(raw)})
 
 
-def inv_npm(home: str, runner=cmd):
+def _npm_global_deps(home: str) -> dict | None:
+    """Return the raw `npm ls -g --json` dependency map, or None if unusable."""
+    rc, out = cmd(["npm", "ls", "-g", "--json", "--depth=0"],
+                  quiet=True, env={"HOME": home})
+    if rc or not out.strip():
+        return None
+    try:
+        deps = (json.loads(out) or {}).get("dependencies") or {}
+    except (AttributeError, ValueError):
+        return None
+    return deps if isinstance(deps, dict) else None
+
+
+def inv_npm(home: str):
     records: list[dict] = []
     warnings: list[str] = []
     notes: list[str] = []
-    env = {"HOME": home}
-    parsed = False
-
-    rc, out = runner(["npm", "ls", "-g", "--json", "--depth=0"],
-                     quiet=True, env=env)
-    if rc == 0 and out.strip():
-        try:
-            deps = (json.loads(out) or {}).get("dependencies") or {}
-            for name, info in deps.items():
-                if not isinstance(name, str) or not name:
-                    continue
-                if isinstance(info, dict) and info.get("missing"):
-                    continue
-                version = info.get("version", "") if isinstance(info, dict) else ""
-                records.append({"installer": "npm", "name": name,
-                                "version": str(version) if version else ""})
-            parsed = True
-            notes.append("npm names from `npm ls -g --json`")
-        except ValueError:
-            pass
-
-    if not parsed:
-        rc, out = runner(["npm", "ls", "-g", "--depth=0", "--parseable"],
-                         quiet=True, env=env)
+    deps = _npm_global_deps(home)
+    if deps is not None:
+        for name, info in deps.items():
+            if not isinstance(name, str) or not name:
+                continue
+            if isinstance(info, dict) and info.get("missing"):
+                continue
+            version = info.get("version", "") if isinstance(info, dict) else ""
+            records.append({"installer": "npm", "name": name,
+                            "version": str(version) if version else ""})
+        notes.append("npm names from `npm ls -g --json`")
+    else:
+        rc, out = cmd(["npm", "ls", "-g", "--depth=0", "--parseable"],
+                      quiet=True, env={"HOME": home})
         if rc == 0:
             for line in out.splitlines():
                 parts = [p for p in line.strip().split("/") if p]
                 if not parts:
                     continue
                 tail = parts[-1]
-                name = f"{parts[-2]}/{tail}" if len(parts) >= 2 and parts[-2].startswith("@") else tail
+                name = (f"{parts[-2]}/{tail}"
+                        if len(parts) >= 2 and parts[-2].startswith("@") else tail)
                 if name in ("node_modules", ""):
                     continue
                 records.append({"installer": "npm", "name": name})
-            parsed = True
             notes.append("npm names from parseable fallback")
-
-    if not parsed:
-        warnings.append("npm not available on source; no global packages recorded")
-    return _dedupe_records(records), warnings, notes, {}
-
-
-def inv_pipx(home: str, runner=cmd):
-    rc, out = runner(["pipx", "list", "--short"], quiet=True, env={"HOME": home})
-    records: list[dict] = []
-    warnings: list[str] = []
-    if rc != 0:
-        warnings.append("pipx not available on source; no tools recorded")
-    else:
-        for line in out.splitlines():
-            s = line.strip()
-            if not s or s.startswith("-"):
-                continue
-            parts = s.rsplit(" ", 1)
-            name, version = s, ""
-            if len(parts) == 2 and _PIPX_VERSION_RE.fullmatch(parts[1]):
-                name, version = parts
-            records.append({"installer": "pipx", "name": name, "version": version})
-    return _dedupe_records(records), warnings, [], {}
-
-
-def inv_cargo(home: str, runner=cmd):
-    rc, out = runner(["cargo", "install", "--list"],
-                     quiet=True, env={"HOME": home})
-    records: list[dict] = []
-    warnings: list[str] = []
-    notes: list[str] = []
-    if rc == 0:
-        for line in out.splitlines():
-            m = _CARGO_LIST_RE.match(line.strip())
-            if m:
-                records.append({"installer": "cargo", "name": m.group(1),
-                                "version": re.sub(r"^v", "", m.group(2)),
-                                "replayable": True})
-        notes.append("cargo names from `cargo install --list`")
-    else:
-        bindir = Path(home) / ".cargo/bin"
-        if bindir.is_dir():
-            for p in sorted(bindir.iterdir()):
-                if (p.name in CARGO_TOOLCHAIN_BINARIES or p.is_symlink()
-                        or not p.is_file() or not os.access(p, os.X_OK)):
-                    continue
-                records.append({"installer": "cargo", "name": p.name,
-                                "replayable": False})
-            warnings.append("cargo absent; names inferred from ~/.cargo/bin "
-                            "(binary names, install commands need review)")
         else:
-            warnings.append("cargo not available on source; no cargo packages recorded")
+            warnings.append("npm not available on source; no global packages recorded")
     return _dedupe_records(records), warnings, notes, {}
+
+
+def inv_pipx(home: str):
+    versions = pipx_global_versions(home)
+    if not versions:
+        return [], ["pipx not available on source; no tools recorded"], [], {}
+    records = [{"installer": "pipx", "name": name, "version": version}
+               for name, version in versions.items()]
+    return _dedupe_records(records), [], [], {}
+
+
+def inv_cargo(home: str):
+    versions = cargo_global_versions(home)
+    if not versions:
+        return [], ["cargo not available on source; no cargo packages recorded"], [], {}
+    records = [{"installer": "cargo", "name": name, "version": version}
+               for name, version in versions.items()]
+    notes = ["cargo names from `cargo install --list`"]
+    return _dedupe_records(records), [], notes, {}
 
 
 def inv_mise(home: str):
@@ -686,14 +668,14 @@ def inv_mise(home: str):
             [], [], {})
 
 
-def inventory_packages(home: str, runner=cmd,
+def inventory_packages(home: str,
                        log_dir: Path = Path("/var/log/installer")) -> tuple[dict, dict]:
     """Return the manifest `packages` dict plus non-secret audit provenance."""
     collected = [
-        inv_apt(runner=runner, log_dir=log_dir),
-        inv_npm(home, runner=runner),
-        inv_pipx(home, runner=runner),
-        inv_cargo(home, runner=runner),
+        inv_apt(log_dir=log_dir),
+        inv_npm(home),
+        inv_pipx(home),
+        inv_cargo(home),
         inv_mise(home),
     ]
     records: list[dict] = []
@@ -710,20 +692,21 @@ def inventory_packages(home: str, runner=cmd,
     for r in records:
         counts[r["installer"]] = counts.get(r["installer"], 0) + 1
 
+    # Apt has no useful version here (apt replay resolves from the archive), so
+    # only installers that need a version for convergence keep full records.
+    versioned = [r for r in records if r["installer"] != "apt"]
     packages = {
         "apt": [r["name"] for r in records if r["installer"] == "apt"],
         "npm": [r["name"] for r in records if r["installer"] == "npm"],
         "pipx": [r["name"] for r in records if r["installer"] == "pipx"],
-        "cargo": [r["name"] for r in records
-                  if r["installer"] == "cargo" and r.get("replayable", True)],
+        "cargo": [r["name"] for r in records if r["installer"] == "cargo"],
         "mise": {"tools": [r["name"] for r in records
                            if r["installer"] == "mise"]},
-        # Full records keep versions for convergence checks and pinned replay.
-        "records": [dict(r) for r in records],
+        "records": [dict(r) for r in versioned],
     }
 
     canonical = "\n".join(json.dumps(r, sort_keys=True, separators=(",", ":"))
-                          for r in records)
+                          for r in versioned)
     meta = {
         "method": INVENTORY_METHOD,
         "counts": counts,
@@ -735,39 +718,26 @@ def inventory_packages(home: str, runner=cmd,
 
 
 # ------------------------------------------------------- convergence checks
-def _pkg_installed(pkg: str, runner=cmd) -> bool:
-    rc, out = runner(["dpkg-query", "-W", "-f=${Status}", pkg], quiet=True)
+def _pkg_installed(pkg: str) -> bool:
+    rc, out = cmd(["dpkg-query", "-W", "-f=${Status}", pkg], quiet=True)
     return rc == 0 and "install ok installed" in out
 
 
 def expected_versions(m: dict, installer: str) -> dict[str, str]:
-    """Name -> version from full records, with a legacy name-only fallback."""
+    """Name -> version from the full inventory records."""
     out: dict[str, str] = {}
     for r in m.get("packages", {}).get("records", []) or []:
         if r.get("installer") != installer:
             continue
-        if installer == "cargo" and r.get("replayable", True) is False:
-            continue
         name = str(r.get("name", ""))
         if name:
             out[name] = str(r.get("version", ""))
-    if out:
-        return out
-    for name in m.get("packages", {}).get(installer, []) or []:
-        n = str(name)
-        if n:
-            out[n] = ""
     return out
 
 
-def npm_global_versions(home: str, runner=cmd) -> dict[str, str]:
-    rc, out = runner(["npm", "ls", "-g", "--json", "--depth=0"],
-                     quiet=True, env={"HOME": home})
-    if rc:
-        return {}
-    try:
-        deps = (json.loads(out) or {}).get("dependencies") or {}
-    except ValueError:
+def npm_global_versions(home: str) -> dict[str, str]:
+    deps = _npm_global_deps(home)
+    if deps is None:
         return {}
     return {
         str(name): str(info.get("version", "")) if isinstance(info, dict) else ""
@@ -775,9 +745,9 @@ def npm_global_versions(home: str, runner=cmd) -> dict[str, str]:
     }
 
 
-def pipx_global_versions(home: str, runner=cmd) -> dict[str, str]:
-    rc, out = runner(["pipx", "list", "--short"], quiet=True,
-                     env={"HOME": home})
+def pipx_global_versions(home: str) -> dict[str, str]:
+    rc, out = cmd(["pipx", "list", "--short"], quiet=True,
+                  env={"HOME": home})
     if rc:
         return {}
     out_map = {}
@@ -793,9 +763,9 @@ def pipx_global_versions(home: str, runner=cmd) -> dict[str, str]:
     return out_map
 
 
-def cargo_global_versions(home: str, runner=cmd) -> dict[str, str]:
-    rc, out = runner(["cargo", "install", "--list"], quiet=True,
-                     env={"HOME": home})
+def cargo_global_versions(home: str) -> dict[str, str]:
+    rc, out = cmd(["cargo", "install", "--list"], quiet=True,
+                  env={"HOME": home})
     if rc:
         return {}
     out_map = {}
@@ -806,9 +776,9 @@ def cargo_global_versions(home: str, runner=cmd) -> dict[str, str]:
     return out_map
 
 
-def git_repo_state(path: Path, runner=cmd) -> dict:
+def git_repo_state(path: Path) -> dict:
     def out_of(*args: str) -> str:
-        rc, out = runner(["git", "-C", str(path), *args], quiet=True)
+        rc, out = cmd(["git", "-C", str(path), *args], quiet=True)
         return out.strip() if rc == 0 else ""
 
     dirty = out_of("status", "--porcelain")
@@ -821,15 +791,14 @@ def git_repo_state(path: Path, runner=cmd) -> dict:
     }
 
 
-def service_state(name: str, runner=cmd) -> dict:
-    rc_a, active = runner(["systemctl", "is-active", name], quiet=True)
-    rc_e, _ = runner(["systemctl", "is-enabled", name], quiet=True)
+def service_state(name: str) -> dict:
+    rc_a, active = cmd(["systemctl", "is-active", name], quiet=True)
+    rc_e, _ = cmd(["systemctl", "is-enabled", name], quiet=True)
     return {"active": rc_a == 0 and active.strip() == "active",
             "enabled": rc_e == 0}
 
 
-def check_convergence(m: dict, dry: bool = False, runner=cmd
-                      ) -> list[tuple[str, bool, str, bool]]:
+def check_convergence(m: dict) -> list[tuple[str, bool, str, bool]]:
     """Compare target state with the effective manifest.
 
     Returns (name, ok, detail, warn). Manual gates are WARN, never PASS.
@@ -840,10 +809,9 @@ def check_convergence(m: dict, dry: bool = False, runner=cmd
         out.append((name, bool(ok), str(detail), bool(warn)))
 
     home = m["target"]["home"]
-    diff = "would differ" if dry else "differs"
 
     missing_apt = [p for p in m.get("packages", {}).get("apt", [])
-                   if not _pkg_installed(p, runner)]
+                   if not _pkg_installed(p)]
     ck("apt:packages", not missing_apt,
        f"missing: {', '.join(missing_apt)}" if missing_apt else "all present")
 
@@ -855,7 +823,7 @@ def check_convergence(m: dict, dry: bool = False, runner=cmd
         want = expected_versions(m, installer)
         if not want:
             continue
-        got = reader(home, runner=runner)
+        got = reader(home)
         missing = [n for n in want if n not in got]
         mismatch = [f"{n}: want {v}, got {got[n]}" for n, v in want.items()
                     if n in got and v and got[n] and got[n] != v]
@@ -863,7 +831,7 @@ def check_convergence(m: dict, dry: bool = False, runner=cmd
                     if n in got and not v]
         if missing or mismatch:
             ck(label, False,
-               f"{diff}; missing={','.join(missing) or '-'}; "
+               f"differs; missing={','.join(missing) or '-'}; "
                f"mismatch={'; '.join(mismatch) or '-'}")
         elif unpinned:
             ck(label, False, f"unpinned: {', '.join(unpinned)}", warn=True)
@@ -885,25 +853,25 @@ def check_convergence(m: dict, dry: bool = False, runner=cmd
             want = (inline.rstrip("\n") + "\n").encode()
             ck(f"key:{u['name']}", dst.is_file() and dst.read_bytes() == want)
         elif ak:
-            src = REPO / ak
+            src = VPS_DATA / ak
             ck(f"key:{u['name']}",
                src.is_file() and dst.is_file() and src.read_bytes() == dst.read_bytes())
 
     for s in m.get("services", {}).get("enable", []):
-        st = service_state(s, runner=runner)
+        st = service_state(s)
         ck(f"service:{s}", st["active"] and st["enabled"],
            f"active={st['active']} enabled={st['enabled']}")
 
     for target, src in m.get("system_files", {}).items():
-        s, d = REPO / src, Path(target)
+        s, d = VPS_DATA / src, Path(target)
         ck(f"system:{target}",
            s.is_file() and d.is_file() and s.read_bytes() == d.read_bytes())
 
     allow_links = str(m.get("policy", {}).get("allow_symlinks", False)).lower() \
         in {"1", "true", "yes", "y"}
-    links = (m.get("baseline", {}).get("dotfile_symlinks", {}) or {})
+    links = (m.get("dotfile_symlinks", {}) or {})
     for target, src in m.get("dotfiles", {}).items():
-        s, d = REPO / src, expand(target, home)
+        s, d = VPS_DATA / src, expand(target, home)
         link = links.get(target) if allow_links else None
         if link:
             want = safe_link_target(link, home)
@@ -915,9 +883,9 @@ def check_convergence(m: dict, dry: bool = False, runner=cmd
 
     for r in m.get("repos", []):
         p = expand(r["path"], home)
-        st = git_repo_state(p, runner=runner)
+        st = git_repo_state(p)
         if not st["commit"]:
-            ck(f"repo:{r['path']}", False, f"not a git checkout ({diff})")
+            ck(f"repo:{r['path']}", False, "not a git checkout (differs)")
         elif r.get("url") and st["url"] and st["url"] != r["url"]:
             ck(f"repo:{r['path']}", False,
                f"url want={r['url']} got={st['url']}")
@@ -949,11 +917,11 @@ def check_convergence(m: dict, dry: bool = False, runner=cmd
                 ck(f"binary:{name}", got == want,
                    "hash matches" if got == want else f"want {want[:12]} got {got[:12]}")
 
-    rc, ss = runner(["ss", "-tulpn"], quiet=True)
+    rc, ss = cmd(["ss", "-tulpn"], quiet=True)
     port = str(m["ssh"]["port"])
     ck("ssh:port", rc == 0 and (f":{port} " in ss or f":{port}\n" in ss),
        f"port {port}")
-    ck("ssh:sshd_t", runner(["sshd", "-t"], quiet=True)[0] == 0)
+    ck("ssh:sshd_t", cmd(["sshd", "-t"], quiet=True)[0] == 0)
     dropin = FINAL_DROPIN if FINAL_DROPIN.is_file() else CUTOVER_DROPIN
     body = dropin.read_text() if dropin.is_file() else ""
     ck("ssh:key_only", "PasswordAuthentication no" in body
@@ -973,8 +941,9 @@ def check_convergence(m: dict, dry: bool = False, runner=cmd
     return out
 
 
-def find_git_repos(home: str, max_depth: int = 4) -> list[Path]:
+def find_git_repos(home: str) -> list[Path]:
     """Shallow scan for git checkouts, pruning caches and vendored plugin dirs."""
+    max_depth = 4
     skip = {".cache", ".cargo", ".bun", ".npm", ".rustup", "node_modules",
             "plugins", ".git"}
     root = Path(home)
@@ -1112,7 +1081,8 @@ def safe_link_target(link: str, home: str) -> str:
 
 def clean_generated_dirs() -> None:
     """Remove stale generated artifacts so re-capture cannot bundle old secrets."""
-    for base in (REPO / "dotfiles", REPO / "system", REPO / "ssh/users"):
+    for base in (VPS_DATA / "dotfiles", VPS_DATA / "system",
+                 VPS_DATA / "ssh/users"):
         if base.exists():
             for p in sorted(base.rglob("*"), key=lambda x: len(x.parts), reverse=True):
                 if p.is_symlink() or p.is_file():
@@ -1123,7 +1093,7 @@ def clean_generated_dirs() -> None:
                     except OSError:
                         pass
         base.mkdir(parents=True, exist_ok=True)
-    ak = REPO / "ssh/authorized_keys"
+    ak = VPS_DATA / "ssh/authorized_keys"
     if ak.is_symlink() or ak.exists():
         ak.unlink()
 
@@ -1163,17 +1133,7 @@ def capture_allowed(src: Path, rel: str) -> bool:
                (f"sha256:{digest}", f"sha256:{digest[:12]}"))
 
 
-def content_secret_hits(src: Path, rel: str) -> list[str]:
-    """Return matched secret-pattern labels for a candidate capture file."""
-    if capture_allowed(src, rel):
-        return []
-    try:
-        raw = src.read_bytes()
-    except OSError:
-        return []
-    if b"\x00" in raw[:4096]:
-        return []
-    text = raw.decode(errors="replace")
+def _secret_hits(text: str) -> list[str]:
     hits = []
     for pattern in SECRET_PATTERNS:
         if pattern.search(text) and pattern.pattern not in hits:
@@ -1181,16 +1141,86 @@ def content_secret_hits(src: Path, rel: str) -> list[str]:
     return hits
 
 
+def content_secret_hits(src: Path, rel: str,
+                        allowed: bool | None = None) -> list[str]:
+    """Return matched secret-pattern labels for a candidate capture file."""
+    if allowed is None:
+        allowed = capture_allowed(src, rel)
+    if allowed:
+        return []
+    try:
+        raw = src.read_bytes()
+    except OSError:
+        return []
+    if b"\x00" in raw[:4096]:
+        return []
+    return _secret_hits(raw.decode(errors="replace"))
+
+
+def _owner_label(st: os.stat_result | None) -> str:
+    """Short user:group label for diagnostics; never raises."""
+    if st is None:
+        return "unknown"
+    try:
+        user = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        user = str(st.st_uid)
+    try:
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = str(st.st_gid)
+    return f"{user}:{group}"
+
+
+def _owner_spec(st: os.stat_result) -> dict:
+    """Portable owner record: prefer names, keep ids as fallback."""
+    try:
+        user = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        user = ""
+    try:
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = ""
+    return {"user": user, "group": group, "uid": st.st_uid, "gid": st.st_gid}
+
+
+def _local_owner(data: dict) -> str | None:
+    """Keep data-dir artifacts writable by the source login after root audit."""
+    return data["target"]["user"] if is_root() else None
+
+
+def _normalize_data_owner(user: str | None) -> None:
+    """Make the whole data tree owned by the human, even after a sudo audit."""
+    if not is_root() or not user or not VPS_DATA.exists():
+        return
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        return
+    paths = [VPS_DATA]
+    paths += sorted((p for p in VPS_DATA.rglob("*") if not p.is_symlink()),
+                    key=lambda p: len(p.parts), reverse=True)
+    for p in paths:
+        try:
+            os.chown(p, pw.pw_uid, pw.pw_gid)
+        except OSError:
+            pass
+
+
 def capture_copy(src: Path, rel: str, dst: Path, pats: list[str],
-                 copied: list, skipped: list, *, label: str = "") -> bool:
+                 copied: list, skipped: list, *, label: str = "",
+                 owners: dict | None = None) -> bool:
     """Path-check, content-scan and copy one source file into the bundle."""
     show = label or rel
+    st = lstat(src)
     why = safe_capture_source(src, rel, pats)
     if why:
         if why != "missing":
             skipped.append((show, why))
         return False
-    hits = content_secret_hits(src, rel)
+    allowed = capture_allowed(src, rel)
+    hits = content_secret_hits(src, rel, allowed=allowed)
     if hits:
         skipped.append((show, "content secret: " + ", ".join(hits[:3])))
         return False
@@ -1198,10 +1228,23 @@ def capture_copy(src: Path, rel: str, dst: Path, pats: list[str],
     try:
         shutil.copy2(src, dst)
     except PermissionError:
-        skipped.append((show, "permission denied - rerun with sudo"))
+        skipped.append((show, "permission denied - rerun with sudo "
+                              f"(source {_owner_label(st)}, "
+                              f"staged {_owner_label(lstat(dst))})"))
         return False
-    copied.append(show + (" (allowed by capture-allow.txt)"
-                          if capture_allowed(src, rel) else ""))
+    # copy2 preserves mode/times but not ownership. Stage files as the source
+    # owner when privileged so later non-root bundle/plan/check steps work.
+    if is_root() and st is not None:
+        try:
+            os.chown(dst, st.st_uid, st.st_gid)
+        except OSError as exc:
+            log(f"capture: could not set owner on {show}: {exc}", "WARN")
+    if owners is not None and st is not None:
+        try:
+            owners[str(dst.relative_to(VPS_DATA))] = _owner_spec(st)
+        except ValueError:
+            pass
+    copied.append(show + (" (allowed by capture-allow.txt)" if allowed else ""))
     return True
 
 
@@ -1251,7 +1294,7 @@ def supplementary_groups(name: str, primary: str) -> list[str]:
 
 
 def capture_user_spec(name: str, pats: list[str], copied: list,
-                      skipped: list) -> dict:
+                      skipped: list, owners: dict | None = None) -> dict:
     if not user_exists(name):
         die(f"cannot capture unknown user: {name}")
     pw = pwd.getpwnam(name)
@@ -1270,7 +1313,7 @@ def capture_user_spec(name: str, pats: list[str], copied: list,
     }
     ak = Path(pw.pw_dir) / ".ssh/authorized_keys"
     rel = f"ssh/users/{name}/authorized_keys"
-    if capture_copy(ak, rel, REPO / rel, pats, copied, skipped):
+    if capture_copy(ak, rel, VPS_DATA / rel, pats, copied, skipped, owners=owners):
         spec["authorized_keys"] = rel
     return spec
 
@@ -1365,7 +1408,7 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
         extra_names = [u["name"] for u in previous]
 
     clean_generated_dirs()
-    copied, skipped, dfmap, sysmap = [], [], {}, {}
+    copied, skipped, dfmap, sysmap, owners = [], [], {}, {}, {}
     prev_by_name = {u["name"]: u for u in previous}
     extra_users = []
     for name in extra_names:
@@ -1373,7 +1416,8 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
             log(f"capture: {name} is already the target user; skipping", "WARN")
             continue
         if user_exists(name):
-            extra_users.append(capture_user_spec(name, pats, copied, skipped))
+            extra_users.append(capture_user_spec(name, pats, copied, skipped,
+                                                 owners))
         elif name in prev_by_name:
             spec = dict(prev_by_name[name])
             spec["authorized_keys"] = ""
@@ -1391,8 +1435,8 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
 
     port = detect_ssh_port()
     try:
-        primary = grp.getgrgid(pwd.getpwnam(user).pw_gid).gr_name
-    except Exception:
+        primary = primary_group(pwd.getpwnam(user)) or user
+    except KeyError:
         primary = user
     sudo_group = "sudo" if in_group(user, "sudo") else ""
 
@@ -1447,7 +1491,7 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
 
     for rel in DOTFILE_ALLOW:
         src = Path(home) / rel
-        dst = REPO / "dotfiles" / rel
+        dst = VPS_DATA / "dotfiles" / rel
         capture_src = src
         link_target = None
         st = lstat(src)
@@ -1458,27 +1502,35 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
                 continue
             capture_src = src.resolve(strict=True)
         label = f"{rel} -> {link_target}" if link_target else rel
-        if capture_copy(capture_src, rel, dst, pats, copied, skipped, label=label):
+        if capture_copy(capture_src, rel, dst, pats, copied, skipped,
+                        label=label, owners=owners):
             target = f"~/{rel}"
-            dfmap[target] = str(dst.relative_to(REPO))
+            dfmap[target] = str(dst.relative_to(VPS_DATA))
             if link_target:
                 data["dotfile_symlinks"][target] = link_target
 
     for abspath in SYSTEM_ALLOW:
         src = Path(abspath)
-        dst = REPO / "system" / str(src).lstrip("/")
-        if capture_copy(src, abspath, dst, pats, copied, skipped):
-            sysmap[abspath] = str(dst.relative_to(REPO))
+        dst = VPS_DATA / "system" / str(src).lstrip("/")
+        if capture_copy(src, abspath, dst, pats, copied, skipped, owners=owners):
+            sysmap[abspath] = str(dst.relative_to(VPS_DATA))
 
     ak = Path(home) / ".ssh/authorized_keys"
-    capture_copy(ak, ".ssh/authorized_keys", REPO / "ssh/authorized_keys",
-                 pats, copied, skipped, label=".ssh/authorized_keys (public keys only)")
+    capture_copy(ak, ".ssh/authorized_keys", VPS_DATA / "ssh/authorized_keys",
+                 pats, copied, skipped, owners=owners,
+                 label=".ssh/authorized_keys (public keys only)")
 
-    dh = REPO / "ssh/sshd_hardening.conf"
+    dh = VPS_DATA / "ssh/sshd_hardening.conf"
     dh.parent.mkdir(parents=True, exist_ok=True)
     dh.write_text(sshd_dropin(port))
+    if is_root():
+        try:
+            shutil.chown(dh, user=user)
+        except (KeyError, OSError) as exc:
+            log(f"capture: could not set owner on generated hardening: {exc}", "WARN")
     copied.append("ssh/sshd_hardening.conf (generated)")
 
+    data["capture_owners"] = owners
     data["dotfiles"] = dfmap
     data["system_files"] = sysmap
     return data, copied, skipped, inv_meta
@@ -1525,18 +1577,20 @@ def write_capture_report(data: dict, copied: list[str],
         "allowlisted paths. To override a false positive, add the relative path",
         "or sha256:<hash> to capture-allow.txt; add path patterns to denylist.txt.",
     ]
-    atomic_write_text(REPORTS / "capture-report.txt", "\n".join(lines) + "\n")
+    atomic_write_text(REPORTS / "capture-report.txt", "\n".join(lines) + "\n",
+                      owner=_local_owner(data))
 
 
 def op_capture(args) -> None:
     data, copied, skipped, inv_meta = collect_baseline(args)
-    atomic_write_text(MANIFEST, toml_dump(data))
+    atomic_write_text(MANIFEST, toml_dump(data), owner=_local_owner(data))
     write_capture_report(data, copied, skipped)
     for w in inv_meta.get("warnings", []):
         log(f"inventory: {w}", "WARN")
     log(f"wrote {MANIFEST}")
     log(f"wrote {REPORTS / 'capture-report.txt'}")
     log(f"{len(copied)} files captured, {len(skipped)} skipped")
+    _normalize_data_owner(data["target"]["user"])
     log("next: review manifest.toml, then `vpsclone plan`")
 
 
@@ -1549,80 +1603,34 @@ TASK_LADDER = [
 
 
 def default_task_defs() -> dict:
+    """Ladder order plus the command that replays each step.
+
+    Checks live in one place (_tui_check_task / check_convergence); declaring
+    them per task here was never executed and only drifted out of date.
+    """
     return {
-        "preflight": {
-            "criticality": "critical", "needs": [],
-            "run": "doctor",
-            "check": ["ssh_reachable", "snapshot_acked", "plan_integrity"],
-        },
-        "accounts": {
-            "criticality": "critical", "needs": ["preflight"],
-            "run": "apply --only=hooks,users",
-            "check": ["user_exists", "sudo_group", "authorized_keys_match"],
-        },
-        "packages": {
-            "criticality": "critical", "needs": ["accounts"],
-            "run": "apply --only=packages",
-            "check": ["dpkg:ufw", "dpkg:fail2ban", "dpkg:openssh-server",
-                      "dpkg:zsh", "cargo_tools"],
-        },
-        "firewall": {
-            "criticality": "critical", "needs": ["packages"],
-            "run": "apply --only=firewall",
-            "check": ["ufw_active", "rules_present"],
-            "gate_before": ["ssh"],
-        },
-        "ssh": {
-            "criticality": "critical", "needs": ["accounts", "firewall"],
-            "run": "apply --only=ssh",
-            "check": ["sshd_t", "port_listening", "password_auth_off",
-                      "allow_users_ok", "fresh_login"],
-        },
-        "system": {
-            "criticality": "safe", "needs": [],
-            "run": "apply --only=system",
-            "check": ["hostname_ok", "timezone_ok", "system_files_match"],
-        },
-        "services": {
-            "criticality": "important", "needs": ["packages"],
-            "run": "apply --only=services",
-            "check": ["services_active"],
-        },
-        "dotfiles": {
-            "criticality": "safe", "needs": [],
-            "run": "apply --only=dotfiles",
-            "check": ["dotfiles_match"],
-        },
-        "deploy_key": {
-            "criticality": "conditional", "needs": [],
-            "run": "keygen --target <target> --name deploy-github",
-            "check": ["github_ssh_ok"],
-        },
-        "repos": {
-            "criticality": "safe", "needs": ["deploy_key"],
-            "run": "apply --only=repos",
-            "check": ["repos_cloned"],
-        },
-        "vault": {
-            "criticality": "optional", "needs": ["accounts"],
-            "run": "vault-unpack --dry-run; vault-unpack --yes",
-            "check": ["vault_files_exist"],
-        },
-        "apps": {
-            "criticality": "safe", "needs": [],
-            "run": "apply --only=binaries,mise",
-            "check": ["binaries_executable"],
-        },
-        "data": {
-            "criticality": "optional", "needs": [],
-            "run": "sync-data --dry-run; sync-data",
-            "check": ["data_synced"],
-        },
-        "verify": {
-            "criticality": "final", "needs": [],
-            "run": "verify",
-            "check": ["verify_expectations"],
-        },
+        "preflight": {"criticality": "critical", "run": "doctor"},
+        "accounts": {"criticality": "critical",
+                     "run": "apply --only=hooks,users"},
+        "packages": {"criticality": "critical",
+                     "run": "apply --only=packages"},
+        "firewall": {"criticality": "critical",
+                     "run": "apply --only=firewall"},
+        "ssh": {"criticality": "critical", "run": "apply --only=ssh"},
+        "system": {"criticality": "safe", "run": "apply --only=system"},
+        "services": {"criticality": "important",
+                     "run": "apply --only=services"},
+        "dotfiles": {"criticality": "safe", "run": "apply --only=dotfiles"},
+        "deploy_key": {"criticality": "conditional",
+                       "run": "keygen --target <target> --name deploy-github"},
+        "repos": {"criticality": "safe", "run": "apply --only=repos"},
+        "vault": {"criticality": "optional",
+                  "run": "vault-unpack --dry-run; vault-unpack --yes"},
+        "apps": {"criticality": "safe",
+                 "run": "apply --only=binaries,mise"},
+        "data": {"criticality": "optional",
+                 "run": "sync-data --dry-run; sync-data"},
+        "verify": {"criticality": "final", "run": "verify"},
     }
 
 
@@ -1635,7 +1643,6 @@ def default_action_defs() -> list[dict]:
     return [
         {
             "id": "provider_snapshot",
-            "task": "preflight",
             "kind": "acknowledge",
             "title": "Provider snapshot",
             "message": "Take a provider snapshot before apply, then press Enter.",
@@ -1643,7 +1650,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "github_deploy_key",
-            "task": "deploy_key",
             "kind": "guided_subprocess",
             "command_id": "keygen",
             "title": "Create GitHub deploy key",
@@ -1655,7 +1661,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "data_paths",
-            "task": "data",
             "kind": "prompt_value",
             "title": "Data paths to sync",
             "target": "data.paths",
@@ -1665,7 +1670,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "allow_symlinks",
-            "task": "dotfiles",
             "kind": "prompt_bool",
             "title": "Allow captured symlinks?",
             "target": "policy.allow_symlinks",
@@ -1676,7 +1680,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "github_key_check",
-            "task": "deploy_key",
             "kind": "guided_subprocess",
             "command_id": "github_ssh",
             "title": "Verify GitHub deploy key",
@@ -1687,7 +1690,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "ssh_prepare",
-            "task": "ssh",
             "kind": "guided_subprocess",
             "command_id": "ssh_cutover_prepare",
             "rollback_seconds": 600,
@@ -1698,7 +1700,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "fresh_login",
-            "task": "ssh",
             "kind": "acknowledge",
             "title": "Verify fresh SSH login",
             "message": "From a NEW local terminal, ssh in on the target port "
@@ -1709,7 +1710,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "ssh_commit",
-            "task": "ssh",
             "kind": "guided_subprocess",
             "command_id": "ssh_cutover_commit",
             "title": "Commit SSH cutover",
@@ -1720,7 +1720,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "data_destination",
-            "task": "data",
             "kind": "prompt_value",
             "title": "Data sync destination",
             "target": "data.destination",
@@ -1731,7 +1730,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "data_sync_dry",
-            "task": "data",
             "kind": "guided_subprocess",
             "command_id": "sync_data",
             "dry_run": True,
@@ -1743,7 +1741,6 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "data_sync_live",
-            "task": "data",
             "kind": "guided_subprocess",
             "command_id": "sync_data",
             "dry_run": False,
@@ -1754,18 +1751,16 @@ def default_action_defs() -> list[dict]:
         },
         {
             "id": "vault_unpack",
-            "task": "vault",
             "kind": "guided_subprocess",
             "command_id": "vault_unpack",
             "title": "Restore secrets from the vault",
             "confirm": "After the unpack attempt, press Enter to continue.",
-            "why": "Runs vault-unpack in a real terminal; any age/gpg passphrase "
+            "why": "Runs vault-unpack in a real terminal; the GPG passphrase "
                    "stays inside that child process.",
             "check_task": "vault",
         },
         {
             "id": "save_session",
-            "task": "preflight",
             "kind": "save_session",
             "title": "Save session values to manifest.toml",
             "why": "Writes effective values to the generated manifest only "
@@ -1784,7 +1779,6 @@ def binary_install_actions(data: dict) -> list[dict]:
         slug = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or f"binary{i}"
         out.append({
             "id": f"binary_install_{i}_{slug}",
-            "task": "apps",
             "kind": "prompt_value",
             "title": f"Install command for {name}",
             "target": f"binaries.{i}.install",
@@ -1805,7 +1799,6 @@ def user_key_actions(m: dict) -> list[dict]:
         slug = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or f"user{i}"
         out.append({
             "id": f"user_key_{i}_{slug}",
-            "task": "accounts",
             "kind": "prompt_value",
             "title": f"Public SSH key for {name}",
             "target": f"users.{i}.authorized_keys_inline",
@@ -1825,7 +1818,7 @@ def _find_secret_paths(value, path: str = "manifest") -> list[str]:
         for i, v in enumerate(value):
             hits += _find_secret_paths(v, f"{path}[{i}]")
     elif isinstance(value, str):
-        if any(p.search(value) for p in SECRET_PATTERNS):
+        if _secret_hits(value):
             hits.append(path)
     return hits
 
@@ -1849,12 +1842,16 @@ def op_audit(args) -> None:
 
     dot_hashes = {}
     for target, rel in data.get("dotfiles", {}).items():
-        p = REPO / rel
+        p = VPS_DATA / rel
         if p.is_file() and not p.is_symlink():
             dot_hashes[target] = sha256_file(p)
 
-    hardening = REPO / data["ssh"]["hardening_file"]
+    hardening = VPS_DATA / data["ssh"]["hardening_file"]
     gaps = [f"inventory: {w}" for w in inv_meta.get("warnings", [])]
+    # A permission skip produces a baseline that silently omits a file; make
+    # that as loud as the other deferred/manual work.
+    gaps += [f"capture: {path}: {why}" for path, why in skipped
+             if why.startswith("permission denied")]
     for b in data.get("binaries", []):
         if not str(b.get("install", "")).strip():
             gaps.append(f"binary {b['name']}: no install command "
@@ -1900,20 +1897,6 @@ def op_audit(args) -> None:
             "dotfiles_sha256": dot_hashes,
             "hardening_sha256": sha256_file(hardening) if hardening.is_file() else "",
         },
-        "auth": {
-            "target": {
-                "mode": "root_ssh",
-                "secret_in_file": False,
-                "note": "sudo/password prompts happen on target only, never stored here",
-            },
-            "github": {"mode": "deploy_key", "key_name": "deploy-github"},
-        },
-        "policy": {
-            "dry_run_first": True,
-            "snapshot_required": True,
-            "allow_reorder": True,
-            "hard_gates": ["accounts", "packages", "firewall", "ssh"],
-        },
         "desired": {
             "target": {
                 "user": {"from": "source.user"},
@@ -1946,14 +1929,6 @@ def op_audit(args) -> None:
         "order": {"tasks": list(TASK_LADDER)},
         "tasks": default_task_defs(),
         "actions": default_action_defs() + binary_install_actions(data),
-        "verify": {
-            "expect": {
-                "password_auth": False,
-                "fail2ban_active": True,
-                "services": list(data.get("services", {}).get("enable", [])),
-                "dotfiles_match": True,
-            },
-        },
         "audit": {
             "captured_files": len(copied),
             "skipped_files": len(skipped),
@@ -1965,8 +1940,9 @@ def op_audit(args) -> None:
     }
 
     out = Path(args.out).expanduser().absolute()
-    atomic_write_text(out, toml_dump(mirror))
-    atomic_write_text(MANIFEST, baseline_text)
+    local_owner = _local_owner(data)
+    atomic_write_text(out, toml_dump(mirror), owner=local_owner)
+    atomic_write_text(MANIFEST, baseline_text, owner=local_owner)
 
     REPORTS.mkdir(exist_ok=True)
     lines = [
@@ -1987,34 +1963,32 @@ def op_audit(args) -> None:
         *([] if gaps else ["  (none)"]),
         *[f"  ! {g}" for g in gaps],
         "",
-        "Next: review mirror.toml and the git diff, commit, bundle, then on the",
-        "target run: sudo vpsclone drive --plan mirror.toml",
+        "Skipped files (denylist / noise / unreadable):",
+        *([f"  - {path}  [{why}]" for path, why in skipped] or ["  (none)"]),
+        "",
+        "Next: review mirror.toml outside Git, git diff for code, then bundle;",
+        f"on the target run: sudo vpsclone drive --plan {out}",
     ]
-    atomic_write_text(REPORTS / "audit-report.txt", "\n".join(lines) + "\n")
+    atomic_write_text(REPORTS / "audit-report.txt", "\n".join(lines) + "\n",
+                      owner=local_owner)
+    _normalize_data_owner(data["target"]["user"])
     log(f"wrote {out}")
     log(f"wrote {MANIFEST} (generated)")
     log(f"wrote {REPORTS / 'audit-report.txt'}")
     log(f"audit: {len(gaps)} gap(s), {len(decisions)} deferred decision(s)")
-    log("next: review mirror.toml + git diff, then `vpsclone bundle`")
+    log(f"next: review {out}, then `vpsclone bundle`")
 
 
-def _ask(value: str, message: str | None, label: str,
-         validate: str | None = None) -> str:
+def _ask(value: str, message: str | None, label: str) -> str:
     prompt = message or label
     if value:
         prompt += f" [{value}]"
     prompt += ": "
-    while True:
-        try:
-            raw = input(prompt).strip()
-        except EOFError:
-            raw = ""
-        answer = raw or value
-        if validate == "port":
-            if not answer.isdigit() or not 1 <= int(answer) <= 65535:
-                print("  enter a port between 1 and 65535")
-                continue
-        return answer
+    try:
+        raw = input(prompt).strip()
+    except EOFError:
+        raw = ""
+    return raw or value
 
 
 def op_drive(args) -> int | None:
@@ -2036,7 +2010,7 @@ def op_drive(args) -> int | None:
             "regenerate with `audit`")
     for target, rel in baseline.get("dotfiles", {}).items():
         want = integ.get("dotfiles_sha256", {}).get(target)
-        p = REPO / rel
+        p = VPS_DATA / rel
         if want and (not p.is_file() or p.is_symlink() or sha256_file(p) != want):
             die(f"captured file changed since audit: {rel} ({target})")
 
@@ -2054,8 +2028,13 @@ def op_drive(args) -> int | None:
     src_port = str(src.get("ssh_port", m["ssh"].get("port", "22")))
     m["ssh"]["old_port"] = src_port
     if ps.get("prompt") or (ps.get("prompt_if_default") and src_port == "22"):
-        m["ssh"]["port"] = _ask(str(ps.get("default", src_port)),
-                                ps.get("message"), "ssh port", validate="port")
+        while True:
+            answer = _ask(str(ps.get("default", src_port)),
+                          ps.get("message"), "ssh port")
+            if answer.isdigit() and 1 <= int(answer) <= 65535:
+                break
+            print("  enter a port between 1 and 65535")
+        m["ssh"]["port"] = answer
         log(f"drive: source port 22 is default; using target port {m['ssh']['port']}")
     else:
         m["ssh"]["port"] = src_port
@@ -2203,23 +2182,17 @@ def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]
     out: list[tuple[str, str, str]] = []
 
     def ck(label, ok, detail="", warn=False):
-        status = "PASS" if ok else ("WARN" if warn else "FAIL")
-        out.append((label, status, str(detail)))
+        out.append((label, "PASS" if ok else ("WARN" if warn else "FAIL"),
+                    str(detail)))
 
-    conv = check_convergence(m, dry=dry)
-
-    def add_conv(*prefixes: str) -> None:
-        for label, ok, detail, warn in conv:
+    prefixes = CONVERGENCE_FOR_TASK.get(name)
+    if prefixes:
+        for label, ok, detail, warn in check_convergence(m):
             if any(label.startswith(p) for p in prefixes):
                 ck(label, ok, detail, warn)
 
-    if name == "preflight":
-        ck("plan integrity", True, "verified by drive")
-        ck("provider snapshot", False, "acknowledge manually before apply", warn=True)
-        ck("target reachability", False, "verify SSH from your local shell", warn=True)
-
-    elif name == "accounts":
-        add_conv("user:", "key:")
+    # Only checks that convergence cannot answer live here.
+    if name == "accounts":
         for u in effective_users(m):
             if u.get("sudo_group"):
                 ck(f"sudo:{u['name']}", in_group(u["name"], u["sudo_group"]))
@@ -2227,7 +2200,6 @@ def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]
     elif name == "packages":
         for pkg in ("ufw", "fail2ban", "openssh-server", "zsh"):
             ck(f"dpkg:{pkg}", _pkg_installed(pkg))
-        add_conv("apt:", "npm:", "pipx:", "cargo:", "mise:")
 
     elif name == "firewall":
         rc, out_s = cmd(["ufw", "status", "verbose"], quiet=True)
@@ -2238,20 +2210,10 @@ def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]
             for rule in m.get("firewall", {}).get("allow", []):
                 ck(f"rule {rule}", rule in out_s)
 
-    elif name == "ssh":
-        add_conv("ssh:", "manual:login")
-
     elif name == "system":
         ck("hostname", socket.gethostname() == m["target"]["hostname"])
         rc, tz = cmd(["timedatectl", "show", "-p", "Timezone", "--value"], quiet=True)
         ck("timezone", rc == 0 and tz.strip() == m.get("system", {}).get("timezone"))
-        add_conv("system:")
-
-    elif name == "services":
-        add_conv("service:")
-
-    elif name == "dotfiles":
-        add_conv("dotfile:")
 
     elif name == "deploy_key":
         rc, out_s = cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
@@ -2260,22 +2222,8 @@ def _tui_check_task(name: str, m: dict, dry: bool) -> list[tuple[str, str, str]]
         ok = rc in (0, 1) and ("successfully authenticated" in out_s.lower()
                                or out_s.lower().startswith("hi "))
         ck("github ssh", ok, detail)
-        add_conv("manual:github")
 
-    elif name == "repos":
-        add_conv("repo:")
-
-    elif name == "apps":
-        add_conv("binary:")
-
-    elif name in ("vault", "data"):
-        add_conv(f"manual:{name}")
-
-    elif name == "verify":
-        ck("post-apply verify",
-           op_verify(argparse.Namespace(manifest_obj=m)) == 0)
-
-    else:
+    elif name not in CONVERGENCE_FOR_TASK and name not in ("preflight", "verify"):
         ck(name, False, f"no check registered for task '{name}'", warn=True)
 
     return out
@@ -2295,12 +2243,6 @@ def _tui_dispatch(run: str, m: dict, dry: bool) -> tuple[int, bool]:
                 manifest_obj=m,
             )
             rc = op_apply(ns)
-        elif part.startswith("keygen"):
-            log("MANUAL: run keygen on your local machine, then paste the pubkey into GitHub")
-            return 0, True
-        elif part.startswith("vault-unpack") or part.startswith("sync-data"):
-            log(f"MANUAL: {part} - confirm and run outside the TUI for now")
-            return 0, True
         else:
             log(f"MANUAL: no executor for '{part}'")
             return 0, True
@@ -2315,11 +2257,8 @@ def _action_argv(action: dict, m: dict | None = None) -> list[str] | None:
     if cid == "keygen":
         return [*exe, "keygen", "--name", str(action.get("name", "deploy-github"))]
     if cid == "vault_unpack":
-        argv = [*exe, "vault-unpack", "--vault-dir",
+        return [*exe, "vault-unpack", "--vault-dir",
                 str(action.get("vault_dir", DEFAULT_VAULT_DIR))]
-        if action.get("profile"):
-            argv += ["--profile", str(action["profile"])]
-        return argv
     if cid == "github_ssh":
         return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-T", "git@github.com"]
@@ -2417,8 +2356,8 @@ def _tui_run_child(argv: list[str]) -> int:
     return rc
 
 
-def _tui_run_action(stdscr, action: dict, m: dict, dry: bool,
-                    known_tasks: set[str]) -> tuple[str, list, int]:
+def _tui_run_action(stdscr, action: dict, m: dict, dry: bool
+                    ) -> tuple[str, list, int]:
     kind = str(action.get("kind", ""))
     title = str(action.get("title", action.get("id", "action")))
     rc = 0
@@ -2498,7 +2437,7 @@ def _tui_run_action(stdscr, action: dict, m: dict, dry: bool,
         return ans, [], rc
 
     task = str(action.get("check_task", ""))
-    results = _tui_check_task(task, m, dry) if task in known_tasks else []
+    results = _tui_check_task(task, m, dry) if task else []
     return "done", results, rc
 
 
@@ -2555,7 +2494,7 @@ def run_tui(plan: dict, m: dict) -> int:
         _tui_put(stdscr, base + 1, 1,
                  str(cur.get("why") or cur.get("message") or "")[:w - 3])
         _tui_put(stdscr, base + 2, 1,
-                 f"task={cur.get('task', '-')}  check={cur.get('check_task', '-')}")
+                 f"check={cur.get('check_task', '-')}")
         stdscr.refresh()
 
     def _render(stdscr) -> None:
@@ -2590,11 +2529,7 @@ def run_tui(plan: dict, m: dict) -> int:
         spec = specs[cur]
         _tui_put(stdscr, base, 1, f"TASK {cur}: {spec.get('run', '')}", bold)
         _tui_put(stdscr, base + 1, 1,
-                 f"criticality={spec.get('criticality', '?')}  "
-                 f"needs={','.join(spec.get('needs', [])) or '-'}  "
-                 f"gates={','.join(spec.get('gate_before', [])) or '-'}")
-        _tui_put(stdscr, base + 2, 1,
-                 f"checks: {', '.join(spec.get('check', [])) or '-'}")
+                 f"criticality={spec.get('criticality', '?')}")
         line = base + 4
         for entry in logs[cur][-max(0, h - base - 6):]:
             if line >= h - 1:
@@ -2617,65 +2552,68 @@ def run_tui(plan: dict, m: dict) -> int:
                        ["Run the TUI as root (sudo vpsclone drive --tui)",
                         "for real target checks and apply steps."])
             return
-        state[name] = "RUNNING"
-        _render(stdscr)
-        buf = io.StringIO()
-        rc = 0
-        manual = False
-        try:
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                rc, manual = _tui_dispatch(str(specs[name].get("run", "")), m, dry)
-                if not manual:
-                    results[name] = _tui_check_task(name, m, dry)
-        except BaseException as exc:
-            buf.write(f"[ERROR] {type(exc).__name__}: {exc}\n")
-            rc = 1
-        logs[name] = buf.getvalue().splitlines()[-200:]
-        fails = [r for r in results.get(name, []) if r[1] == "FAIL"]
-        if manual:
-            state[name] = "SKIPPED"
-        elif rc or fails:
-            state[name] = "FAILED"
-        else:
-            state[name] = "DONE"
+        while True:
+            state[name] = "RUNNING"
+            _render(stdscr)
+            buf = io.StringIO()
+            rc = 0
+            manual = False
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    rc, manual = _tui_dispatch(str(specs[name].get("run", "")), m, dry)
+                    if not manual:
+                        results[name] = _tui_check_task(name, m, dry)
+            except BaseException as exc:
+                buf.write(f"[ERROR] {type(exc).__name__}: {exc}\n")
+                rc = 1
+            logs[name] = buf.getvalue().splitlines()[-200:]
+            fails = [r for r in results.get(name, []) if r[1] == "FAIL"]
+            if manual:
+                state[name] = "SKIPPED"
+            elif rc or fails:
+                state[name] = "FAILED"
+            else:
+                state[name] = "DONE"
 
-        lines = [f"task: {name}  exit={rc}  state={state[name]}", ""]
-        lines += [x for x in logs[name][-8:]]
-        lines += [f"[{s}] {lbl} {det}" for lbl, s, det in results.get(name, [])]
-        action = _tui_modal(stdscr, f"RESULT - {name.upper()}", lines)
-        if action == "quit":
-            raise KeyboardInterrupt
-        if action == "retry":
-            _run_selected(stdscr)
-        elif action == "skip":
-            state[name] = "SKIPPED"
+            lines = [f"task: {name}  exit={rc}  state={state[name]}", ""]
+            lines += [x for x in logs[name][-8:]]
+            lines += [f"[{s}] {lbl} {det}" for lbl, s, det in results.get(name, [])]
+            action = _tui_modal(stdscr, f"RESULT - {name.upper()}", lines)
+            if action == "quit":
+                raise KeyboardInterrupt
+            if action == "retry":
+                continue
+            if action == "skip":
+                state[name] = "SKIPPED"
+            return
 
     def _run_selected_action(stdscr) -> None:
-        nonlocal aselected, view
+        nonlocal aselected
         if not actions:
             return
-        action = actions[aselected]
-        aid = str(action["id"])
-        if astate[aid] == "DONE":
+        while True:
+            action = actions[aselected]
+            aid = str(action["id"])
+            if astate[aid] == "DONE":
+                return
+            astate[aid] = "RUNNING"
+            _render(stdscr)
+            status, checks, rc = _tui_run_action(stdscr, action, m, dry)
+            if status == "quit":
+                raise KeyboardInterrupt
+            if status == "skip":
+                astate[aid] = "SKIPPED"
+            else:
+                fails = [c for c in checks if c[1] == "FAIL"]
+                astate[aid] = "DONE" if rc == 0 and not fails else "FAILED"
+            lines = [f"action: {aid}  exit={rc}  state={astate[aid]}"]
+            lines += [f"[{s}] {l} {d}" for l, s, d in checks]
+            ans = _tui_modal(stdscr, f"ACTION - {aid.upper()}", lines)
+            if ans == "quit":
+                raise KeyboardInterrupt
+            if ans == "retry":
+                continue
             return
-        astate[aid] = "RUNNING"
-        _render(stdscr)
-        status, checks, rc = _tui_run_action(
-            stdscr, action, m, dry, set(names))
-        if status == "quit":
-            raise KeyboardInterrupt
-        if status == "skip":
-            astate[aid] = "SKIPPED"
-        else:
-            fails = [c for c in checks if c[1] == "FAIL"]
-            astate[aid] = "DONE" if rc == 0 and not fails else "FAILED"
-        lines = [f"action: {aid}  exit={rc}  state={astate[aid]}"]
-        lines += [f"[{s}] {l} {d}" for l, s, d in checks]
-        ans = _tui_modal(stdscr, f"ACTION - {aid.upper()}", lines)
-        if ans == "quit":
-            raise KeyboardInterrupt
-        if ans == "retry":
-            _run_selected_action(stdscr)
 
     def _main(stdscr) -> None:
         nonlocal selected, dry, aselected, view
@@ -2730,77 +2668,54 @@ def run_tui(plan: dict, m: dict) -> int:
 
 
 # ---------------------------------------------------------------- plan
-def pkg_installed(pkg: str) -> bool:
-    rc, out = cmd(["dpkg-query", "-W", "-f=${Status}", pkg], quiet=True)
-    return rc == 0 and "install ok installed" in out
-
-
 def op_plan(args) -> None:
     m = load_manifest()
-    home = m["target"]["home"]
-    rows = []
+    conv = check_convergence(m)
 
-    pkgs = m.get("packages", {})
-    missing = [p for p in pkgs.get("apt", []) if not pkg_installed(p)]
-    rows.append(("apt packages", f"{len(missing)} to install" if missing else "ok",
-                 ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else "")))
+    def pending(prefix: str, status: str, limit: int = 8) -> tuple[str, str]:
+        bad = [name.split(":", 1)[1] for name, ok, _detail, _warn in conv
+               if name.startswith(prefix) and not ok]
+        if not bad:
+            return "ok", ""
+        detail = ", ".join(bad[:limit]) + (" ..." if len(bad) > limit else "")
+        return f"{len(bad)} {status}", detail
+
     def pinned_count(installer: str) -> int:
         return sum(1 for v in expected_versions(m, installer).values() if v)
 
-    rows.append(("npm/pipx", "ok",
-                 f"{len(expected_versions(m, 'npm'))}/{len(expected_versions(m, 'pipx'))} "
-                 f"configured ({pinned_count('npm')}/{pinned_count('pipx')} pinned)"))
-    rows.append(("cargo", "ok",
-                 f"{len(expected_versions(m, 'cargo'))} recorded "
-                 f"({pinned_count('cargo')} pinned) - replayed via cargo install"))
-
-    users = effective_users(m)
-    missing_users = [u["name"] for u in users if not user_exists(u["name"])]
-    rows.append(("users", f"{len(missing_users)} to create" if missing_users else "ok",
-                 ", ".join(missing_users[:8])))
-
-    df = []
-    for target, src in m.get("dotfiles", {}).items():
-        s, d = REPO / src, expand(target, home)
-        if not s.is_file():
-            df.append(f"MISSING SOURCE {src}")
-        elif not d.is_file() or d.read_bytes() != s.read_bytes():
-            df.append(target)
-    rows.append(("dotfiles", f"{len(df)} to write" if df else "ok", ", ".join(df[:8])))
-
-    sf = []
-    for target, src in m.get("system_files", {}).items():
-        s, d = REPO / src, Path(target)
-        if not s.is_file():
-            sf.append(f"MISSING SOURCE {src}")
-        elif not d.is_file() or d.read_bytes() != s.read_bytes():
-            sf.append(target)
-    rows.append(("system files", f"{len(sf)} to write" if sf else "ok", ", ".join(sf[:5])))
+    apt_detail = next(detail for name, _ok, detail, _warn in conv
+                      if name == "apt:packages")
+    missing = apt_detail.split("missing: ", 1)[1] if "missing: " in apt_detail else ""
+    rows = [
+        ("apt packages",
+         f"{len(missing.split(', '))} to install" if missing else "ok", missing),
+        ("npm/pipx", "ok",
+         f"{len(expected_versions(m, 'npm'))}/{len(expected_versions(m, 'pipx'))} "
+         f"configured ({pinned_count('npm')}/{pinned_count('pipx')} pinned)"),
+        ("cargo", "ok",
+         f"{len(expected_versions(m, 'cargo'))} recorded "
+         f"({pinned_count('cargo')} pinned) - replayed via cargo install"),
+        ("users", *pending("user:", "to create")),
+        ("dotfiles", *pending("dotfile:", "to write")),
+        ("system files", *pending("system:", "to write", limit=5)),
+    ]
 
     port = str(m["ssh"]["port"])
     allow = m.get("firewall", {}).get("allow", [])
     rows.append(("firewall", "open " + ",".join(allow) if allow else "no rules",
                  f"ssh={port}/tcp"))
 
-    svcs = m.get("services", {}).get("enable", [])
-    noton = []
-    for s in svcs:
-        rc, out = cmd(["systemctl", "is-enabled", s], quiet=True)
-        if rc != 0:
-            noton.append(s)
-    rows.append(("services", f"{len(noton)} to enable" if noton else "ok", ", ".join(noton)))
+    rows.append(("services", *pending("service:", "to enable")))
 
     repos = m.get("repos", [])
     pinnedrepos = sum(1 for r in repos if str(r.get("commit", "")).strip())
-    missingrepos = [r["path"] for r in repos if not expand(r["path"], home).exists()]
-    rows.append(("repos", f"{len(missingrepos)} to clone" if missingrepos else "ok",
-                 f"{pinnedrepos} commit-pinned; " + ", ".join(missingrepos[:6])))
+    repo_status, repo_detail = pending("repo:", "to clone", limit=6)
+    rows.append(("repos", repo_status, f"{pinnedrepos} commit-pinned; " + repo_detail))
 
-    bins = [b["name"] for b in m.get("binaries", [])
-            if not expand(b["path"], home).exists()]
     noinstall = [b["name"] for b in m.get("binaries", [])
                  if not b.get("install", "").strip()]
-    rows.append(("binaries", f"{len(bins)} missing" if bins else "ok",
+    binary_status, _binary_detail = pending("binary:", "missing")
+    rows.append(("binaries", binary_status,
                  f"no installer configured: {', '.join(noinstall[:4])}"))
 
     print(f"\nPLAN  target={m['target']['user']}@{m['target']['hostname']}  "
@@ -2846,9 +2761,52 @@ class Backups:
         log(f"backup index: {self.root / 'index.json'}")
 
 
+def _resolve_capture_owner(spec: dict) -> tuple[int, int] | None:
+    """Resolve a captured owner on the target; names win, ids are fallback."""
+    if not isinstance(spec, dict):
+        return None
+    uid = gid = None
+    name = str(spec.get("user") or "")
+    if name:
+        try:
+            uid = pwd.getpwnam(name).pw_uid
+        except KeyError:
+            pass
+    if uid is None and isinstance(spec.get("uid"), int):
+        uid = spec["uid"]
+    group = str(spec.get("group") or "")
+    if group:
+        try:
+            gid = grp.getgrnam(group).gr_gid
+        except KeyError:
+            pass
+    if gid is None and isinstance(spec.get("gid"), int):
+        gid = spec["gid"]
+    if uid is None or gid is None:
+        return None
+    return int(uid), int(gid)
+
+
+def _restore_capture_owner(path: Path, m: dict, src: str, *,
+                           symlink: bool = False) -> None:
+    """Apply the captured user:group after a managed file or link is written."""
+    spec = (m.get("capture_owners") or {}).get(str(src))
+    if not spec:
+        return
+    ids = _resolve_capture_owner(spec)
+    if ids is None:
+        log(f"owner: cannot resolve {spec.get('user', '')}:"
+            f"{spec.get('group', '')} for {src}; keeping manifest default", "WARN")
+        return
+    try:
+        os.chown(path, *ids, follow_symlinks=not symlink)
+    except OSError as exc:
+        log(f"owner: could not set {src}: {exc}", "WARN")
+
+
 def write_managed(src, dst, *, mode=None, owner=None, backups: Backups | None = None) -> bool:
     s, d = Path(src), Path(dst)
-    assert_regular_file(s, root=REPO)
+    assert_regular_file(s, root=VPS_DATA)
     data = s.read_bytes()
     assert_regular_file(d, must_exist=False)
     if d.exists() and d.read_bytes() == data:
@@ -2899,13 +2857,13 @@ def write_text_managed(text: str, dst, *, mode=None, owner=None,
     return True
 
 
-def step_packages(m, dry, backups) -> None:
+def step_packages(m, dry) -> None:
     pkgs = m.get("packages", {})
     user = m["target"]["user"]
     home = m["target"]["home"]
     env = {"HOME": home}
 
-    missing = [p for p in pkgs.get("apt", []) if not pkg_installed(p)]
+    missing = [p for p in pkgs.get("apt", []) if not _pkg_installed(p)]
     if not missing:
         log("apt: all manifest packages present")
     elif dry:
@@ -2998,12 +2956,12 @@ def ensure_group(name: str, dry: bool) -> None:
         log(f"users: could not create group {name}", "WARN")
 
 
-def repo_asset(rel: str) -> Path:
+def data_asset(rel: str) -> Path:
     p = Path(rel)
     if p.is_absolute() or ".." in p.parts:
-        die(f"unsafe repo asset path: {rel}")
-    fp = REPO / p
-    assert_no_symlink_components(fp, root=REPO)
+        die(f"unsafe data asset path: {rel}")
+    fp = VPS_DATA / p
+    assert_no_symlink_components(fp, root=VPS_DATA)
     return fp
 
 
@@ -3060,7 +3018,7 @@ def step_users(m, dry, backups) -> None:
 
         ak_rel = u.get("authorized_keys", "")
         inline_keys = str(u.get("authorized_keys_inline", "") or "").strip()
-        src = repo_asset(ak_rel) if ak_rel else None
+        src = data_asset(ak_rel) if ak_rel else None
         need_ssh = bool(src) or bool(inline_keys) or u["ssh_allow"]
         if need_ssh and not create_home and not home.is_dir():
             log(f"users: home {home} missing for {name}; skipping ssh setup", "WARN")
@@ -3091,6 +3049,7 @@ def step_users(m, dry, backups) -> None:
                 else:
                     write_managed(src, target_ak, mode=0o600, owner=name,
                                   backups=backups)
+                    _restore_capture_owner(target_ak, m, ak_rel)
             elif src:
                 log(f"users: authorized_keys source missing for {name}: {ak_rel}", "WARN")
 
@@ -3121,11 +3080,11 @@ def step_dotfiles(m, dry, backups) -> None:
     owner = m["target"]["user"]
     allow_links = str(m.get("policy", {}).get("allow_symlinks", False)).lower() \
         in {"1", "true", "yes", "y"}
-    links = (m.get("baseline", {}).get("dotfile_symlinks", {}) or {})
+    links = (m.get("dotfile_symlinks", {}) or {})
     n = 0
     for target, src in m.get("dotfiles", {}).items():
         d = expand(target, home)
-        s = REPO / src
+        s = VPS_DATA / src
         mode = 0o600 if str(d).endswith("/.ssh/config") else None
         link = links.get(target) if allow_links else None
         if dry:
@@ -3140,17 +3099,23 @@ def step_dotfiles(m, dry, backups) -> None:
                 log(f"dotfiles: would write {d}")
                 n += 1
         elif link:
-            if write_managed_symlink(link, d, home=home, owner=owner,
-                                     backups=backups):
+            changed = write_managed_symlink(link, d, home=home, owner=owner,
+                                            backups=backups)
+            _restore_capture_owner(d, m, src, symlink=True)
+            if changed:
                 n += 1
-        elif write_managed(s, d, mode=mode, owner=owner, backups=backups):
-            n += 1
+        else:
+            changed = write_managed(s, d, mode=mode, owner=owner,
+                                    backups=backups)
+            _restore_capture_owner(d, m, src)
+            if changed:
+                n += 1
     log(f"dotfiles: {n} written/needed")
 
 
 def step_system_files(m, dry, backups) -> None:
     for target, src in m.get("system_files", {}).items():
-        d, s = Path(target), REPO / src
+        d, s = Path(target), VPS_DATA / src
         if dry:
             if not s.is_file():
                 log(f"system: missing source {s}", "WARN")
@@ -3158,6 +3123,7 @@ def step_system_files(m, dry, backups) -> None:
                 log(f"system: would write {d}")
         else:
             write_managed(s, d, mode=0o644, backups=backups)
+            _restore_capture_owner(d, m, src)
     cloud = m.get("cloud", {})
     cloud_dropin = Path("/etc/cloud/cloud.cfg.d/99-vpsclone.cfg")
     body = ""
@@ -3176,7 +3142,7 @@ def step_system_files(m, dry, backups) -> None:
                 log(f"wrote {cloud_dropin}")
 
 
-def step_firewall(m, dry, backups) -> None:
+def step_firewall(m, dry) -> None:
     fw = m.get("firewall", {})
     if not fw.get("enable", True):
         log("firewall: disabled in manifest")
@@ -3210,7 +3176,7 @@ def ssh_unit() -> str:
     return "sshd" if rc == 0 and "sshd.service" in out else "ssh"
 
 
-CUTOVER_STATE = REPO / "ssh-cutover.json"
+CUTOVER_STATE = VPS_DATA / "ssh-cutover.json"
 FINAL_DROPIN = Path("/etc/ssh/sshd_config.d/99-vpsclone.conf")
 CUTOVER_DROPIN = Path("/etc/ssh/sshd_config.d/99-vpsclone-cutover.conf")
 
@@ -3247,6 +3213,17 @@ def _restore_ssh_files(final_bytes: bytes | None,
             _write_dropin(path, data.decode())
 
 
+def _revert_ssh(final_bytes: bytes | None, cutover_bytes: bytes | None,
+                message: str | None = None) -> tuple[int, str]:
+    """Restore drop-ins AND reload sshd; abort if `message` is given and invalid."""
+    _restore_ssh_files(final_bytes, cutover_bytes)
+    rc, out = cmd(["sshd", "-t"], check=False)
+    cmd(["systemctl", "reload", ssh_unit()], check=False)
+    if rc and message:
+        die(f"{message}\n{out.strip()}".rstrip())
+    return rc, out
+
+
 def _load_cutover() -> dict | None:
     if not CUTOVER_STATE.is_file():
         return None
@@ -3276,7 +3253,7 @@ def _spawn_cutover_watchdog(seconds: int, token: str) -> None:
 
 def ssh_cutover_prepare(m: dict, backups, rollback_seconds: int = 600) -> None:
     """Open both ports, reload, verify, then wait for explicit commit."""
-    src = REPO / m["ssh"]["hardening_file"]
+    src = VPS_DATA / m["ssh"]["hardening_file"]
     if not src.is_file():
         log("ssh: hardening file missing", "WARN")
         return
@@ -3298,8 +3275,8 @@ def ssh_cutover_prepare(m: dict, backups, rollback_seconds: int = 600) -> None:
         CUTOVER_STATE.unlink(missing_ok=True)
         rc, out = cmd(["sshd", "-t"])
         if rc:
-            _restore_ssh_files(prev_final, prev_cutover)
-            die(f"sshd -t failed; reverted drop-in:\n{out.strip()}")
+            _revert_ssh(prev_final, prev_cutover,
+                        f"sshd -t failed; reverted drop-in:\n{out.strip()}")
         cmd(["systemctl", "reload", ssh_unit()], check=False)
         log(f"ssh: no port change ({new_port}); final drop-in applied")
         return
@@ -3314,17 +3291,15 @@ def ssh_cutover_prepare(m: dict, backups, rollback_seconds: int = 600) -> None:
     FINAL_DROPIN.unlink(missing_ok=True)
     rc, out = cmd(["sshd", "-t"])
     if rc:
-        _restore_ssh_files(prev_final, prev_cutover)
-        die(f"sshd -t failed; reverted drop-in:\n{out.strip()}")
+        _revert_ssh(prev_final, prev_cutover,
+                    f"sshd -t failed; reverted drop-in:\n{out.strip()}")
     rc, out = cmd(["systemctl", "reload", ssh_unit()], check=False)
     if rc:
-        _restore_ssh_files(prev_final, prev_cutover)
-        cmd(["systemctl", "reload", ssh_unit()], check=False)
-        die(f"sshd reload failed; reverted drop-in:\n{out.strip()}")
+        _revert_ssh(prev_final, prev_cutover,
+                    f"sshd reload failed; reverted drop-in:\n{out.strip()}")
     if not (_port_listening(new_port) and _port_listening(old_port)):
-        _restore_ssh_files(prev_final, prev_cutover)
-        cmd(["systemctl", "reload", ssh_unit()], check=False)
-        die(f"sshd did not listen on both ports ({old_port}, {new_port}); reverted")
+        _revert_ssh(prev_final, prev_cutover,
+                    f"sshd did not listen on both ports ({old_port}, {new_port})")
 
     token = secrets.token_hex(8)
     _save_cutover({
@@ -3352,7 +3327,7 @@ def ssh_cutover_commit(m: dict, backups) -> None:
     if str(state["new_port"]) != new_port:
         die(f"manifest port {new_port} no longer matches prepared cutover "
             f"{state['new_port']}; run ssh-cutover-rollback first")
-    src = REPO / m["ssh"]["hardening_file"]
+    src = VPS_DATA / m["ssh"]["hardening_file"]
     if not src.is_file():
         die("hardening file missing; cannot commit ssh cutover")
 
@@ -3364,13 +3339,12 @@ def ssh_cutover_commit(m: dict, backups) -> None:
     CUTOVER_DROPIN.unlink(missing_ok=True)
     rc, out = cmd(["sshd", "-t"])
     if rc:
-        _restore_ssh_files(prev_final, prev_cutover)
-        die(f"sshd -t failed during commit; reverted:\n{out.strip()}")
+        _revert_ssh(prev_final, prev_cutover,
+                    f"sshd -t failed during commit; reverted:\n{out.strip()}")
     rc, out = cmd(["systemctl", "reload", ssh_unit()], check=False)
     if rc or not _port_listening(new_port):
-        _restore_ssh_files(prev_final, prev_cutover)
-        cmd(["systemctl", "reload", ssh_unit()], check=False)
-        die(f"ssh commit failed on port {new_port}; reverted:\n{out.strip()}")
+        _revert_ssh(prev_final, prev_cutover,
+                    f"ssh commit failed on port {new_port}; reverted:\n{out.strip()}")
     CUTOVER_STATE.unlink(missing_ok=True)
     log(f"ssh: cutover committed on port {new_port}; old firewall rule left "
         "for manual cleanup")
@@ -3384,11 +3358,9 @@ def ssh_cutover_rollback() -> None:
         if state.get("previous_final") is not None else None
     prev_cutover = (state.get("previous_cutover") or "").encode() \
         if state.get("previous_cutover") is not None else None
-    _restore_ssh_files(prev_final, prev_cutover)
-    rc, out = cmd(["sshd", "-t"])
+    rc, out = _revert_ssh(prev_final, prev_cutover)
     if rc:
         die(f"sshd -t failed after rollback:\n{out.strip()}")
-    cmd(["systemctl", "reload", ssh_unit()], check=False)
     CUTOVER_STATE.unlink(missing_ok=True)
     log(f"ssh: rolled back to port {state['old_port']}")
 
@@ -3437,7 +3409,7 @@ def step_ssh(m, dry, backups) -> None:
     ssh_cutover_prepare(m, backups)
 
 
-def step_services(m, dry, backups) -> None:
+def step_services(m, dry) -> None:
     for s in m.get("services", {}).get("enable", []):
         if dry:
             if cmd(["systemctl", "is-enabled", s], quiet=True)[0] != 0:
@@ -3448,7 +3420,7 @@ def step_services(m, dry, backups) -> None:
             "INFO" if rc == 0 else "WARN")
 
 
-def step_mise(m, dry, backups) -> None:
+def step_mise(m, dry) -> None:
     tools = m.get("packages", {}).get("mise", {}).get("tools", [])
     if not tools:
         return
@@ -3476,7 +3448,7 @@ def step_mise(m, dry, backups) -> None:
         log("; ".join(failed)[:200], "WARN")
 
 
-def step_binaries(m, dry, backups) -> None:
+def step_binaries(m, dry) -> None:
     user, home = m["target"]["user"], m["target"]["home"]
     for b in m.get("binaries", []):
         install = b.get("install", "").strip()
@@ -3496,7 +3468,7 @@ def step_binaries(m, dry, backups) -> None:
             "INFO" if rc == 0 else "WARN")
 
 
-def step_repos(m, dry, backups) -> None:
+def step_repos(m, dry) -> None:
     home = m["target"]["home"]
     user = m["target"]["user"]
     for r in m.get("repos", []):
@@ -3549,7 +3521,7 @@ def run_hook(path: str, dry: bool) -> None:
         die(f"hook {path} failed with exit code {rc}")
 
 
-def step_hooks(m, dry, backups) -> None:
+def step_hooks(m, dry) -> None:
     run_hook(m.get("hooks", {}).get("pre_apply", "hooks/pre-apply.sh"), dry)
 
 
@@ -3594,7 +3566,10 @@ def op_apply(args) -> int:
         for name in STEP_ORDER:
             if name in selected:
                 log(f"--- step: {name} ---")
-                steps[name](m, args.dry_run, backups)
+                if name in ("users", "dotfiles", "system", "ssh"):
+                    steps[name](m, args.dry_run, backups)
+                else:
+                    steps[name](m, args.dry_run)
     except BaseException as exc:
         backups.save()
         log("apply aborted; any backups taken are indexed for rollback", "ERROR")
@@ -3627,11 +3602,6 @@ def op_verify(args) -> int:
         checks.append((name, bool(ok), detail, warn))
 
     ck("root privileges", is_root())
-    rc, out = cmd(["python3", "--version"], quiet=True)
-    ck("python3 >= 3.11", rc == 0 and tuple(map(int, (out.split()[1].split(".")[:2]))) >= (3, 11))
-    ck("target user exists", user_exists(m["target"]["user"]), m["target"]["user"])
-    rc, ufwout = cmd(["ufw", "status"], quiet=True)
-    ck("ufw active", rc == 0 and "Status: active" in ufwout)
     dots = Path(home) / ".config/dots/dots"
     ck("dotS installed", dots.exists(), str(dots), warn=True)
 
@@ -3655,23 +3625,25 @@ def op_verify(args) -> int:
 
 # -------------------------------------------------------------- keygen
 def validate_key_name(name: str) -> str:
+    reserved = {"config", "authorized_keys", "known_hosts", "environment"}
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in (".", "..")
-            or name.startswith("-")):
-        die(f"invalid key name {name!r}: use letters, digits, '.', '_' or '-'")
+            or name.startswith("-") or name in reserved or name.endswith(".pub")):
+        die(f"invalid key name {name!r}: reserved name or unsafe characters")
     return name
 
 
 def validate_ssh_target(target: str) -> str:
-    if target.startswith("-") or any(c.isspace() for c in target):
+    if not target or target.startswith("-") or any(c.isspace() for c in target):
         die(f"invalid ssh target {target!r}")
     return target
 
 
 def op_keygen(args) -> None:
     name = validate_key_name(args.name or "deploy-github")
-    comment = args.comment or f"{getpass.getuser()}@{socket.gethostname()}"
-    sshdir = Path.home() / ".ssh"
-    assert_no_symlink_components(sshdir, root=Path.home())
+    who = os.environ.get("SUDO_USER") or getpass.getuser()
+    comment = args.comment or f"{who}@{socket.gethostname()}"
+    sshdir = DATA_HOME / ".ssh"
+    assert_no_symlink_components(sshdir, root=DATA_HOME)
     sshdir.mkdir(mode=0o700, exist_ok=True)
     os.chmod(sshdir, 0o700)
     key = sshdir / name
@@ -3688,11 +3660,11 @@ def op_keygen(args) -> None:
     log(f"generated {key}")
 
     if args.save_pub:
-        dst = REPO / "ssh" / f"{name}.pub"
+        dst = VPS_DATA / "ssh" / f"{name}.pub"
         dst.parent.mkdir(parents=True, exist_ok=True)
-        assert_no_symlink_components(dst, root=REPO)
+        assert_no_symlink_components(dst, root=VPS_DATA)
         shutil.copy2(pub, dst)
-        log(f"saved public half to {dst} (safe to commit)")
+        log(f"saved public half to {dst} (in the data dir)")
 
     print("\n=== COPY THIS INTO GITHUB -> Settings -> SSH and GPG keys -> New SSH key ===")
     print(pub.read_text().strip())
@@ -3730,12 +3702,24 @@ BUNDLE_README = """\
 VPS MIRROR BUNDLE
 =================
 
+The archive has two trees:
+
+  vps-mirror/       code and docs (safe to commit)
+  vps-mirror-data/  captured files, mirror.toml, manifest.toml, reports
+
 On the FRESH Ubuntu box (as root):
 
   1. apt-get update && apt-get install -y python3 git rsync openssh-server
   2. tar xzf vps-mirror-*.tar.gz -C /opt/
   3. cd /opt/vps-mirror && chmod +x vpsclone bootstrap.sh
-  4. ./bootstrap.sh                 # or: sudo python3 vpsclone apply
+  4. ./bootstrap.sh
+
+bootstrap.sh installs vps-mirror-data into the invoking user's ~/.vps-data,
+even when it is run with sudo. You can also run the steps by hand:
+
+  install -d -m 0700 ~/.vps-data
+  cp -a ../vps-mirror-data/. ~/.vps-data/
+  sudo python3 vpsclone apply
 
 Then, from your LOCAL machine, generate + ship the deploy key:
 
@@ -3746,39 +3730,57 @@ Add the printed public key to GitHub, then on the VPS:
   ssh -T git@github.com
   python3 vpsclone apply --only=repos
 
-Secrets are NOT in this bundle. Private keys are generated locally and
-scp'd separately. See README.md for the full playbook.
+Secrets, vaults and backups are NOT in this bundle. Private keys are generated
+locally and scp'd separately. See README.md for the full playbook.
 """
+
+
+def _bundle_entries(root: Path, prefix: str, skip: set[str],
+                    pats: list[str]) -> list[tuple[Path, str]]:
+    """Collect and validate regular files from one bundle source tree."""
+    entries: list[tuple[Path, str]] = []
+    if not root.exists():
+        return entries
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root)
+        if any(part in skip for part in rel.parts) or p.is_symlink():
+            continue
+        if not p.is_file():
+            continue
+        name = p.name
+        if name.endswith((".tar.gz", ".tgz", ".gpg", ".key", ".pem", ".bak")):
+            continue
+        if name.startswith("id_") and not name.endswith(".pub"):
+            continue
+        if is_denied(str(rel), pats) or is_denied(str(p.resolve()), pats):
+            die(f"refusing to bundle denied file: {rel}")
+        entries.append((p, f"{prefix}/{rel}"))
+    return entries
 
 
 def op_bundle(args) -> None:
     pats = load_denylist()
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = Path(args.output) if args.output else REPO.parent / f"vps-mirror-{stamp}.tar.gz"
+    if not (VPS_DATA / "mirror.toml").is_file() or not MANIFEST.is_file():
+        die(f"no captured data in {VPS_DATA} - run `audit` first")
+    out = Path(args.output) if args.output else VPS_DATA / f"vps-mirror-{stamp}.tar.gz"
     assert_no_symlink_components(out)
     if out.is_symlink() or (out.exists() and not out.is_file()):
         die(f"refusing unsafe bundle output path: {out}")
-    skip = {".git", "backups", "__pycache__", "reports", "vault", "secrets",
-            ".vault", "ssh-cutover.json"}
 
     # Validate every member before creating the archive. tarfile.add() on a
     # directory recurses, which would otherwise include denied files before the
     # loop ever reaches them.
-    entries = []
-    for p in sorted(REPO.rglob("*")):
-        rel = p.relative_to(REPO)
-        if any(part in skip for part in rel.parts) or p.is_symlink():
-            continue
-        if not p.is_file():
-            continue
-        if is_denied(str(rel), pats) or is_denied(str(p.resolve()), pats):
-            die(f"refusing to bundle denied file: {rel}")
-        entries.append((p, rel))
+    entries = _bundle_entries(REPO, "vps-mirror",
+                              {".git", "__pycache__", ".vps-data"}, pats)
+    entries += _bundle_entries(VPS_DATA, "vps-mirror-data",
+                               {"vault", "backups", "keys", "secrets", ".vault",
+                                "ssh-cutover.json"}, pats)
 
     try:
         with tarfile.open(out, "w:gz") as tf:
-            for p, rel in entries:
-                tf.add(p, arcname=f"vps-mirror/{rel}", recursive=False)
+            for p, arc in entries:
+                tf.add(p, arcname=arc, recursive=False)
             data = BUNDLE_README.encode()
             info = tarfile.TarInfo("vps-mirror/BUNDLE_README.txt")
             info.size = len(data)
@@ -3810,7 +3812,7 @@ def remote_scp_argv(target: str, port: str | int,
 def op_remote_drive(args) -> int:
     """Bundle locally, ship over ssh, then run target-side drive in a TTY."""
     target = validate_ssh_target(args.target)
-    port = str(args.port or 22)
+    port = str(args.port if args.port is not None else 22)
     if not _valid_port(port):
         die(f"invalid ssh port: {port!r}")
 
@@ -3827,8 +3829,11 @@ def op_remote_drive(args) -> int:
         script = (
             f"tar xzf {shlex.quote(remote_dir)}/bundle.tar.gz "
             f"-C {shlex.quote(remote_dir)} && "
+            f"mkdir -p \"$HOME/.vps-data\" && "
+            f"cp -a {shlex.quote(remote_dir)}/vps-mirror-data/. \"$HOME/.vps-data/\" && "
             f"cd {shlex.quote(remote_dir)}/vps-mirror && "
-            "python3 vpsclone drive --plan mirror.toml --tui"
+            "sudo python3 vpsclone drive "
+            "--plan \"$HOME/.vps-data/mirror.toml\" --tui"
         )
         rc, _ = cmd(remote_ssh_argv(target, port, script, tty=True),
                     capture=False, check=False)
@@ -3923,15 +3928,16 @@ def op_sync_data(args) -> None:
 
 # -------------------------------------------------------------- vault
 # Secrets live here, never in the repo. The repo only knows the command names.
-DEFAULT_VAULT_DIR = Path.home() / ".local/share/vps-mirror-vault"
+DEFAULT_VAULT_DIR = VPS_DATA / "vault"
 VAULT_CONFIG_NAME = "vault.toml"
 VAULT_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
+
+def valid_vault_alias(alias: str) -> bool:
+    return isinstance(alias, str) and VAULT_ALIAS_RE.match(alias) is not None
+
 VAULT_CONFIG_TEMPLATE = """\
 version = 1
-backend = "__BACKEND__"
-recipient_file = "keys/recipient.txt"
-identity_file = "keys/age.txt"
 passphrase_file = "keys/passphrase.txt"
 archives_dir = "archives"
 backups_dir = "backups"
@@ -3942,7 +3948,6 @@ VAULT_INVENTORY_TEMPLATE = """\
 # This inventory lives OUTSIDE the git repo. Never copy it into the mirror.
 # Aliases are safe labels; the paths and values below are real and stay here.
 version = 1
-profile = "main"
 
 [targets."github-deploy"]
 path = "~/.ssh/deploy-github"
@@ -3962,8 +3967,8 @@ This directory is intentionally **outside** the git repo and outside
 the mirror.
 
 - `inventory.toml` contains real paths and identity values. Keep it here only.
-- `keys/` contains key material (age identity or GPG passphrase). Keep it here
-  only, mode 0600.
+- `keys/passphrase.txt` is the GPG symmetric passphrase. Keep it here only,
+  mode 0600.
 - `archives/` contains encrypted tarballs only. Safest to copy these to offline
   media or a separate private store.
 - `bin/pack.sh` and `bin/unpack.sh` are thin wrappers with no embedded secrets.
@@ -3986,7 +3991,7 @@ Other commands:
 
 Restore never follows symlinks, validates archive members, backs up anything it
 would overwrite into `backups/`, and asks for confirmation unless `--yes` is
-given. Encryption uses `age` when available, otherwise GPG symmetric.
+given. Encryption uses GPG symmetric encryption with the local passphrase file.
 """
 
 
@@ -4017,34 +4022,19 @@ def vault_load_config(vdir: Path) -> dict:
         cfg = tomllib.load(f)
     if cfg.get("version") != 1:
         die("unsupported vault config version")
-    if cfg.get("backend") not in ("age", "gpg"):
-        die("vault config backend must be 'age' or 'gpg'")
     return cfg
 
 
-def vault_backend(cfg: dict, vdir: Path):
-    """Return (backend, extension, encrypt-template, decrypt-template)."""
-    backend = cfg["backend"]
-    if backend == "age":
-        if not shutil.which("age") or not shutil.which("age-keygen"):
-            die("age backend needs both `age` and `age-keygen` installed")
-        recipient = vault_path(vdir, cfg.get("recipient_file", "keys/recipient.txt"))
-        identity = vault_path(vdir, cfg.get("identity_file", "keys/age.txt"))
-        assert_regular_file(recipient, root=vdir)
-        assert_regular_file(identity, root=vdir)
-        enc = ["age", "-R", str(recipient), "-o", "__OUT__", "__IN__"]
-        dec = ["age", "-d", "-i", str(identity), "-o", "__OUT__", "__IN__"]
-        return backend, "age", enc, dec
-
+def vault_backend(cfg: dict, vdir: Path) -> tuple[list[str], list[str]]:
+    """Return (encrypt-template, decrypt-template) for GPG symmetric crypto."""
     if not shutil.which("gpg"):
         die("gpg backend needs `gpg` installed")
     passfile = vault_path(vdir, cfg.get("passphrase_file", "keys/passphrase.txt"))
     assert_regular_file(passfile, root=vdir)
     base = ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback",
             "--passphrase-file", str(passfile)]
-    enc = base + ["-o", "__OUT__", "-c", "__IN__"]
-    dec = base + ["-o", "__OUT__", "-d", "__IN__"]
-    return backend, "gpg", enc, dec
+    return (base + ["-o", "__OUT__", "-c", "__IN__"],
+            base + ["-o", "__OUT__", "-d", "__IN__"])
 
 
 def vault_run(template: list[str], src: Path, dst: Path) -> None:
@@ -4053,7 +4043,7 @@ def vault_run(template: list[str], src: Path, dst: Path) -> None:
     cmd(argv, check=True, quiet=True)
 
 
-def vault_inventory(vdir: Path, cfg: dict, profile: str | None = None):
+def vault_inventory(vdir: Path, cfg: dict) -> list[dict]:
     p = vault_path(vdir, cfg.get("inventory", "inventory.toml"))
     assert_no_symlink_components(vdir)
     assert_regular_file(p, root=vdir)
@@ -4061,9 +4051,6 @@ def vault_inventory(vdir: Path, cfg: dict, profile: str | None = None):
         inv = tomllib.load(f)
     if inv.get("version") != 1:
         die("unsupported vault inventory version")
-    prof = profile or inv.get("profile")
-    if not isinstance(prof, str) or not prof.strip():
-        die("vault inventory needs a profile")
     items = []
     seen = set()
     for kind, table in (("target", inv.get("targets", {})),
@@ -4071,7 +4058,7 @@ def vault_inventory(vdir: Path, cfg: dict, profile: str | None = None):
         if not isinstance(table, dict):
             die(f"vault inventory [{kind}s] must be a table")
         for alias, spec in table.items():
-            if not isinstance(alias, str) or not VAULT_ALIAS_RE.match(alias):
+            if not valid_vault_alias(alias):
                 die(f"invalid vault alias: {alias}")
             key = (kind, alias)
             if key in seen:
@@ -4098,7 +4085,7 @@ def vault_inventory(vdir: Path, cfg: dict, profile: str | None = None):
                           "mode": mode, "value": value})
     if not items:
         die("vault inventory has no items")
-    return prof, items
+    return items
 
 
 def vault_member(kind: str, alias: str) -> str:
@@ -4121,9 +4108,8 @@ def vault_archive(vdir: Path, cfg: dict, explicit: str | None = None) -> Path:
         return p
     d = vault_path(vdir, cfg.get("archives_dir", "archives"))
     assert_no_symlink_components(d, root=vdir)
-    candidates = []
-    for pat in ("secrets-*.age", "secrets-*.gpg"):
-        candidates += [p for p in d.glob(pat) if p.is_file() and not p.is_symlink()]
+    candidates = [p for p in d.glob("secrets-*.gpg")
+                  if p.is_file() and not p.is_symlink()]
     if not candidates:
         die(f"no vault archives in {d}")
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -4131,7 +4117,7 @@ def vault_archive(vdir: Path, cfg: dict, explicit: str | None = None) -> Path:
 
 def vault_read_archive(vdir: Path, cfg: dict, archive: Path):
     """Decrypt and validate; returns (meta, {member-name: bytes}). Never extracts."""
-    _, _, _, dec = vault_backend(cfg, vdir)
+    _, dec = vault_backend(cfg, vdir)
     assert_regular_file(archive)
     with tempfile.TemporaryDirectory(prefix="vault-read-", dir=vdir) as td:
         tar_path = Path(td) / "secrets.tar.gz"
@@ -4150,7 +4136,7 @@ def vault_read_archive(vdir: Path, cfg: dict, archive: Path):
                 kind, sep, alias = m.name.partition("/")
                 if sep != "/" or kind not in ("targets", "identities"):
                     die(f"vault archive has unknown member: {m.name}")
-                if not VAULT_ALIAS_RE.match(alias) or "/" in alias:
+                if not valid_vault_alias(alias):
                     die(f"vault archive has invalid alias: {alias}")
                 if m.size > 100 * 1024 * 1024:
                     die("vault archive member is too large")
@@ -4168,10 +4154,8 @@ def vault_read_archive(vdir: Path, cfg: dict, archive: Path):
             for ent in meta["items"]:
                 kind = ent.get("kind")
                 alias = ent.get("alias")
-                if kind not in ("target", "identity") or not isinstance(alias, str):
+                if kind not in ("target", "identity") or not valid_vault_alias(alias):
                     die("vault archive metadata has an invalid item")
-                if not VAULT_ALIAS_RE.match(alias):
-                    die("vault archive metadata has an invalid alias")
                 listed.add(vault_member(kind, alias))
             if listed != expected:
                 die("vault archive metadata does not match its members")
@@ -4192,8 +4176,8 @@ def add_git_excludes() -> None:
     info.mkdir(parents=True, exist_ok=True)
     p = info / "exclude"
     lines = p.read_text(errors="replace").splitlines() if p.exists() else []
-    additions = [x for x in ("/vault/", "/secrets/", "/.vault/",
-                             "*.age", "*.gpg") if x not in lines]
+    additions = [x for x in ("/vault/", "/secrets/", "/.vault/", "*.gpg")
+                 if x not in lines]
     if additions:
         with p.open("a") as f:
             f.write("\n# vps-mirror vault (local guard)\n")
@@ -4217,42 +4201,21 @@ def op_vault_scaffold(args) -> None:
         os.chmod(p, 0o700)
         assert_no_symlink_components(p, root=vdir)
 
-    backend = args.backend
-    if backend == "auto":
-        backend = ("age" if shutil.which("age") and shutil.which("age-keygen")
-                   else "gpg")
-
-    if backend == "age":
-        if not shutil.which("age") or not shutil.which("age-keygen"):
-            die("age backend needs both `age` and `age-keygen` installed")
-        ident = vdir / "keys/age.txt"
-        recip = vdir / "keys/recipient.txt"
-        if ident.exists():
-            if not args.force:
-                die(f"age identity already exists: {ident}")
-            assert_regular_file(ident, root=vdir)
-            ident.unlink()
-        rc, out = cmd(["age-keygen", "-o", str(ident)], check=True, quiet=True)
-        m = re.search(r"age1[0-9a-z]+", out)
-        if not m:
-            die("could not parse age public key from age-keygen output")
-        atomic_write_text(recip, m.group(0) + "\n", mode=0o644)
-        os.chmod(ident, 0o600)
+    # --force refreshes generated wrappers only. Keys and inventory are
+    # user-owned data: rotating the passphrase makes existing archives
+    # undecryptable and overwriting the inventory destroys real paths.
+    if not shutil.which("gpg"):
+        die("gpg backend needs `gpg` installed")
+    passfile = vdir / "keys/passphrase.txt"
+    if passfile.exists():
+        assert_regular_file(passfile, root=vdir)
     else:
-        if not shutil.which("gpg"):
-            die("gpg backend needs `gpg` installed")
-        passfile = vdir / "keys/passphrase.txt"
-        if passfile.exists():
-            if not args.force:
-                die(f"gpg passphrase file already exists: {passfile}")
-            assert_regular_file(passfile, root=vdir)
-            passfile.unlink()
         atomic_write_text(passfile, secrets.token_urlsafe(32) + "\n", mode=0o600)
 
-    atomic_write_text(cfgp, VAULT_CONFIG_TEMPLATE.replace("__BACKEND__", backend),
-                      mode=0o600)
+    if not cfgp.exists():
+        atomic_write_text(cfgp, VAULT_CONFIG_TEMPLATE, mode=0o600)
     invp = vdir / "inventory.toml"
-    if not invp.exists() or args.force:
+    if not invp.exists():
         atomic_write_text(invp, VAULT_INVENTORY_TEMPLATE, mode=0o600)
 
     vpsclone = shlex.quote(str(Path(__file__).resolve()))
@@ -4269,15 +4232,15 @@ def op_vault_scaffold(args) -> None:
     atomic_write_text(vdir / "README.md",
                       VAULT_README.replace("__VAULT__", str(vdir)), mode=0o644)
     add_git_excludes()
-    log(f"vault: scaffolded {vdir} (backend: {backend})")
+    log(f"vault: scaffolded {vdir} (backend: gpg)")
     log("vault: edit inventory.toml, then run bin/pack.sh")
 
 
 def op_vault_pack(args) -> None:
     vdir = vault_dir_arg(args)
     cfg = vault_load_config(vdir)
-    _, ext, enc, _ = vault_backend(cfg, vdir)
-    prof, items = vault_inventory(vdir, cfg, args.profile)
+    enc, _ = vault_backend(cfg, vdir)
+    items = vault_inventory(vdir, cfg)
 
     if args.dry_run:
         for i in items:
@@ -4300,7 +4263,7 @@ def op_vault_pack(args) -> None:
     assert_no_symlink_components(archives, root=vdir)
     stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
     out = (Path(args.output).expanduser().absolute() if args.output
-           else archives / f"secrets-{prof}-{stamp}.{ext}")
+           else archives / f"secrets-{stamp}.gpg")
     if out.exists():
         die(f"refusing to overwrite existing archive: {out}")
     if args.output:
@@ -4312,7 +4275,6 @@ def op_vault_pack(args) -> None:
         tar_path = Path(td) / "secrets.tar.gz"
         meta = {
             "version": 1,
-            "profile": prof,
             "created": now(),
             "items": [{"kind": i["kind"], "alias": i["alias"],
                        "mode": oct(i["mode"])} for i, _ in payload],
@@ -4330,10 +4292,8 @@ def op_vault_unpack(args) -> None:
     vdir = vault_dir_arg(args)
     cfg = vault_load_config(vdir)
     archive = vault_archive(vdir, cfg, args.archive)
-    prof, items = vault_inventory(vdir, cfg, args.profile)
+    items = vault_inventory(vdir, cfg)
     meta, blobs = vault_read_archive(vdir, cfg, archive)
-    if meta.get("profile") != prof:
-        die(f"archive profile {meta.get('profile')!r} != inventory profile {prof!r}")
 
     item_map = {(i["kind"], i["alias"]): i for i in items}
     restore = []
@@ -4380,7 +4340,6 @@ def op_vault_unpack(args) -> None:
                 write_bytes_no_symlink(bp, dst.read_bytes(),
                                        mode=stat.S_IMODE(st.st_mode))
         write_bytes_no_symlink(dst, data, mode=i["mode"])
-        os.chmod(dst, i["mode"])
         log(f"vault: restored {i['kind']}:{i['alias']}")
     log(f"vault: restore complete ({len(restore)} items)")
 
@@ -4388,9 +4347,8 @@ def op_vault_unpack(args) -> None:
 def op_vault_list(args) -> None:
     vdir = vault_dir_arg(args)
     cfg = vault_load_config(vdir)
-    prof, items = vault_inventory(vdir, cfg, args.profile)
+    items = vault_inventory(vdir, cfg)
     print(f"VAULT {vdir}")
-    print(f"  profile: {prof}")
     for i in items:
         present = (i["kind"] == "identity" or
                    (i["path"].is_file() and not i["path"].is_symlink()))
@@ -4404,7 +4362,6 @@ def op_vault_verify(args) -> None:
     archive = vault_archive(vdir, cfg, args.archive)
     meta, blobs = vault_read_archive(vdir, cfg, archive)
     print(f"VAULT ARCHIVE {archive.name}")
-    print(f"  profile: {meta.get('profile')}")
     print(f"  items:   {len(meta['items'])}")
     print(f"  payload: {len(blobs) - 1 if 'meta.json' in blobs else len(blobs)} file(s)")
     log("vault: archive verified")
@@ -4539,14 +4496,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("vault-scaffold", help="create an out-of-git secrets vault")
     c.add_argument("--dir", default=str(DEFAULT_VAULT_DIR), help="vault directory")
-    c.add_argument("--backend", choices=("auto", "age", "gpg"), default="auto")
     c.add_argument("--force", action="store_true",
                    help="refresh generated files (never deletes archives/keys)")
     c.set_defaults(func=op_vault_scaffold)
 
     c = sub.add_parser("vault-pack", help="encrypt secrets into an archive")
     c.add_argument("--vault-dir", default=str(DEFAULT_VAULT_DIR))
-    c.add_argument("--profile", help="inventory profile (default: inventory's)")
     c.add_argument("--output", help="archive path (default: vault archives/)")
     c.add_argument("--dry-run", action="store_true")
     c.set_defaults(func=op_vault_pack)
@@ -4554,14 +4509,12 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("vault-unpack", help="restore secrets from an archive")
     c.add_argument("--vault-dir", default=str(DEFAULT_VAULT_DIR))
     c.add_argument("--archive", help="archive path (default: latest in vault)")
-    c.add_argument("--profile", help="inventory profile (default: inventory's)")
     c.add_argument("--dry-run", action="store_true")
     c.add_argument("--yes", action="store_true", help="skip confirmation prompt")
     c.set_defaults(func=op_vault_unpack)
 
     c = sub.add_parser("vault-list", help="list vault aliases (no values/paths)")
     c.add_argument("--vault-dir", default=str(DEFAULT_VAULT_DIR))
-    c.add_argument("--profile", help="inventory profile")
     c.set_defaults(func=op_vault_list)
 
     c = sub.add_parser("vault-verify", help="verify an encrypted vault archive")
