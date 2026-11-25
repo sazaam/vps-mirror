@@ -114,7 +114,8 @@ used for every install command; free-form commands are never read from the
 descriptor.
 
 **Dotfiles.** `audit` looks for an expanded allowlist: the original shell, git,
-mise, OpenCode and herdr configs plus common files such as `.inputrc`,
+mise, curated OpenCode files (`cli.json`, `tui.jsonc`, `AGENTS.md`, plugin JS),
+herdr configs, plus common files such as `.inputrc`,
 `.tmux.conf`, `.editorconfig`, `.gitattributes`, fish/nvim/helix configs,
 starship/alacritty/kitty/wezterm/foot/zellij configs, ripgrep/fd/lazygit/lsd/bat
 configs, direnv, pip/cargo/gem and XDG housekeeping files. Secret-shaped configs
@@ -128,7 +129,19 @@ Broken links and links pointing outside the source home are reported as skipped,
 never followed. In the TUI, the **`allow_symlinks`** yes/no action asks
 “Allow captured symlinks?”: `yes` recreates the recorded symlink on the target;
 `no` (the default) writes a regular file instead. `verify` checks whichever mode
-you chose.
+you chose. The captured `~/.config/opencode/AGENTS.md` link points into the
+dotS repo, which is cloned as a git repo; the `commands/dots` link is recreated
+by `install-dots.sh` on the target, so it is not duplicated as a dotfile.
+
+**Agent state snapshot (opt-in).** Prompt history, model/TUI state and any
+session files under `~/.local/state/opencode` are **not** bundled by default.
+To include them, set `enable = true` under `[baseline.agent_state]` in
+`~/.vps-data/mirror.toml` (or `[agent_state]` in `~/.vps-data/manifest.toml`),
+optionally editing `paths` / `exclude`, then re-run `audit`. Settings survive
+re-audits. Snapshotted files are staged under
+`agent-state/`, pass the same denylist and content-secret scan as dotfiles, and
+are replayed by `apply --only=agent_state` / the `agent_state` TUI task.
+`service.json`, credentials and secret-shaped files stay excluded.
 
 **Convergence checks.** `verify` and the TUI now compare target state with the
 effective manifest: package versions, repo URL/branch/commit, source binary

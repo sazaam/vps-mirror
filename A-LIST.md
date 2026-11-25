@@ -42,3 +42,8 @@ was deliberately taught to do.
   - Mise-aware tool resolution lists npm/pipx/cargo globals even when the tool is not on plain `PATH`.
   - Manifest-driven `toolchain` task confirms and installs missing managers before dependent installs.
   - `[[project_deps]]` records detected Node/Rust managers; skipped-by-default TUI actions and CLI subcommands install per project on request.
+
+- [x] **10. Agent config and opt-in agent state**
+  - Curated OpenCode/herdr config files and the `AGENTS.md` symlink are captured like other dotfiles.
+  - `~/.local/state/opencode` snapshots are opt-in via `[agent_state]`, denylisted and content-scanned like every other capture.
+  - Snapshots replay through the `agent_state` step/task and are convergence-checked.

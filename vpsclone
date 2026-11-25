@@ -75,6 +75,10 @@ BASE_DOTFILES = [
     ".config/mise/config.toml",
     ".config/opencode/cli.json",
     ".config/opencode/tui.jsonc",
+    ".config/opencode/AGENTS.md",
+    ".config/opencode/plugins/herdr-agent-state.js",
+    ".config/opencode/herdr-opencode/tui.js",
+    ".config/opencode/herdr-tui-session.js",
     ".config/herdr/config.toml",
     ".config/herdr/.plugins.lock",
     ".ssh/config",
@@ -926,6 +930,11 @@ def check_convergence(m: dict) -> list[tuple[str, bool, str, bool]]:
             ck(f"dotfile:{target}",
                s.is_file() and d.is_file() and s.read_bytes() == d.read_bytes())
 
+    for target, src in (m.get("agent_state", {}).get("files", {}) or {}).items():
+        s, d = VPS_DATA / src, expand(target, home)
+        ck(f"agent_state:{target}",
+           s.is_file() and d.is_file() and s.read_bytes() == d.read_bytes())
+
     for r in m.get("repos", []):
         p = expand(r["path"], home)
         st = git_repo_state(p)
@@ -1195,7 +1204,7 @@ def safe_link_target(link: str, home: str) -> str:
 def clean_generated_dirs() -> None:
     """Remove stale generated artifacts so re-capture cannot bundle old secrets."""
     for base in (VPS_DATA / "dotfiles", VPS_DATA / "system",
-                 VPS_DATA / "ssh/users"):
+                 VPS_DATA / AGENT_STATE_DIR, VPS_DATA / "ssh/users"):
         if base.exists():
             for p in sorted(base.rglob("*"), key=lambda x: len(x.parts), reverse=True):
                 if p.is_symlink() or p.is_file():
@@ -1361,6 +1370,106 @@ def capture_copy(src: Path, rel: str, dst: Path, pats: list[str],
     return True
 
 
+# ------------------------------------------------- opt-in agent-state snapshot
+AGENT_STATE_DIR = "agent-state"
+AGENT_STATE_DEFAULT = {
+    "enable": False,
+    "paths": ["~/.local/state/opencode"],
+    "exclude": ["*service.json*", "*.log", "*.sqlite", "*.db", "*.sock",
+                "*.pid", "*/.cache/*"],
+}
+
+
+def normalize_agent_state(cfg) -> dict:
+    """Keep the opt-in settings durable without trusting arbitrary structures."""
+    if not isinstance(cfg, dict):
+        cfg = {}
+    enable = cfg.get("enable", False)
+    if isinstance(enable, str):
+        enable = enable.strip().lower() in {"1", "true", "yes", "y"}
+    else:
+        enable = bool(enable)
+    paths = cfg.get("paths", AGENT_STATE_DEFAULT["paths"])
+    excludes = cfg.get("exclude", AGENT_STATE_DEFAULT["exclude"])
+    if not isinstance(paths, list):
+        paths = []
+    if not isinstance(excludes, list):
+        excludes = []
+    return {
+        "enable": enable,
+        "paths": [str(p).strip() for p in paths if str(p).strip()],
+        "exclude": [str(x).strip() for x in excludes if str(x).strip()],
+        "files": {},
+    }
+
+
+def load_previous_agent_state(plan_path: Path | None = None) -> dict:
+    """Read the last opt-in settings from the manifest or plan; survive re-audit."""
+    candidates = ([plan_path] if plan_path is not None else []) + [MANIFEST]
+    for path in candidates:
+        if not path or not path.exists():
+            continue
+        try:
+            with path.open("rb") as f:
+                old = tomllib.load(f)
+        except Exception:
+            continue
+        baseline = old.get("baseline", {}) or {}
+        cfg = old.get("agent_state") or baseline.get("agent_state", {})
+        if isinstance(cfg, dict):
+            return cfg
+    return {}
+
+
+def snapshot_agent_state(home: str, cfg: dict, pats: list[str], copied: list,
+                         skipped: list, owners: dict) -> dict:
+    """Stage opt-in agent state files with the same gates as dotfiles."""
+    if not cfg.get("enable"):
+        return {}
+    files: dict[str, str] = {}
+    root = Path(home).resolve()
+    base = VPS_DATA / AGENT_STATE_DIR
+    snap_pats = list(pats) + [str(x) for x in cfg.get("exclude", []) if str(x)]
+    for raw in cfg.get("paths", []):
+        raw = str(raw)
+        try:
+            src = expand(raw, home)
+            resolved = src.resolve(strict=True)
+        except (OSError, RuntimeError):
+            skipped.append((raw, "missing"))
+            continue
+        if src.is_symlink():
+            skipped.append((raw, "symlink (refusing to follow)"))
+            continue
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            skipped.append((raw, "outside home"))
+            continue
+        if resolved.is_file():
+            candidates = [resolved]
+        elif resolved.is_dir():
+            candidates = sorted(
+                p for p in resolved.rglob("*")
+                if p.is_file() and not p.is_symlink()
+            )
+        else:
+            skipped.append((raw, "not a regular file or directory"))
+            continue
+        for candidate in candidates:
+            try:
+                rel = candidate.relative_to(root)
+            except ValueError:
+                skipped.append((str(candidate), "outside home"))
+                continue
+            target = "~/" + str(rel)
+            dst = base / rel
+            if capture_copy(candidate, target, dst, snap_pats, copied, skipped,
+                            owners=owners):
+                files[target] = str(dst.relative_to(VPS_DATA))
+    return files
+
+
 USER_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\$?$")
 NOLOGIN_SHELLS = {
     "/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false", "false",
@@ -1511,6 +1620,8 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
     The last element is non-secret package-inventory provenance.
     """
     pats = load_denylist()
+    agent_cfg = normalize_agent_state(
+        getattr(args, "agent_state_cfg", None) or load_previous_agent_state())
     user = args.user or os.environ.get("SUDO_USER") or getpass.getuser()
     previous = load_previous_users()
     if getattr(args, "clear_users", False):
@@ -1593,6 +1704,7 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
         "project_deps": detect_project_deps(home, repos),
         "binaries": detect_binaries(home),
         "data": {"paths": [], "exclude": []},
+        "agent_state": agent_cfg,
         "cloud": {"preserve_hostname": True, "manage_etc_hosts": False},
         "hooks": {
             "pre_apply": "hooks/pre-apply.sh",
@@ -1623,6 +1735,9 @@ def collect_baseline(args) -> tuple[dict, list[str], list[tuple[str, str]], dict
             dfmap[target] = str(dst.relative_to(VPS_DATA))
             if link_target:
                 data["dotfile_symlinks"][target] = link_target
+
+    data["agent_state"]["files"] = snapshot_agent_state(
+        home, agent_cfg, pats, copied, skipped, owners)
 
     for abspath in SYSTEM_ALLOW:
         src = Path(abspath)
@@ -1672,6 +1787,8 @@ def write_capture_report(data: dict, copied: list[str],
         f"git repos: {len(data['repos'])}   "
         f"project deps: {len(data.get('project_deps', []))}   "
         f"external binaries: {len(data['binaries'])}",
+        f"agent state: {len(data.get('agent_state', {}).get('files', {}))} file(s)"
+        f" [{'enabled' if data.get('agent_state', {}).get('enable') else 'opt-in'}]",
         "",
         "Ship list (captured into bundle):",
         *[f"  + {c}" for c in copied],
@@ -1714,7 +1831,7 @@ def op_capture(args) -> None:
 # ---------------------------------------------------------------- audit / drive
 TASK_LADDER = [
     "preflight", "toolchain", "accounts", "packages", "firewall", "ssh", "system",
-    "services", "dotfiles", "deploy_key", "repos", "vault", "apps",
+    "services", "dotfiles", "agent_state", "deploy_key", "repos", "vault", "apps",
     "data", "verify",
 ]
 
@@ -1739,6 +1856,8 @@ def default_task_defs() -> dict:
         "services": {"criticality": "important",
                      "run": "apply --only=services"},
         "dotfiles": {"criticality": "safe", "run": "apply --only=dotfiles"},
+        "agent_state": {"criticality": "optional",
+                        "run": "apply --only=agent_state"},
         "deploy_key": {"criticality": "conditional",
                        "run": "keygen --target <target> --name deploy-github"},
         "repos": {"criticality": "safe", "run": "apply --only=repos"},
@@ -1979,6 +2098,9 @@ def _persist_session(m: dict) -> tuple[bool, str]:
 
 def op_audit(args) -> None:
     """Local pass: author mirror.toml and a ready-to-ship generated manifest."""
+    if getattr(args, "agent_state_cfg", None) is None:
+        args.agent_state_cfg = load_previous_agent_state(
+            Path(args.out).expanduser().absolute())
     data, copied, skipped, inv_meta = collect_baseline(args)
     baseline_text = toml_dump(data)
     source_port = str(data["ssh"]["port"])
@@ -2309,6 +2431,7 @@ CONVERGENCE_FOR_TASK = {
     "system": ("system:",),
     "services": ("service:",),
     "dotfiles": ("dotfile:",),
+    "agent_state": ("agent_state:",),
     "repos": ("repo:",),
     "apps": ("binary:",),
     "deploy_key": ("manual:github",),
@@ -3393,6 +3516,31 @@ def step_dotfiles(m, dry, backups) -> None:
     log(f"dotfiles: {n} written/needed")
 
 
+def step_agent_state(m, dry, backups) -> None:
+    cfg = m.get("agent_state", {}) or {}
+    if not cfg.get("enable"):
+        log("agent state: opt-in disabled; nothing to replay")
+        return
+    home = m["target"]["home"]
+    owner = m["target"]["user"]
+    files = cfg.get("files", {}) or {}
+    n = 0
+    for target, src in files.items():
+        d, s = expand(target, home), VPS_DATA / src
+        if dry:
+            if not s.is_file():
+                log(f"agent state: missing source {s}", "WARN")
+            elif not d.is_file() or d.read_bytes() != s.read_bytes():
+                log(f"agent state: would write {d}")
+                n += 1
+            continue
+        changed = write_managed(s, d, mode=None, owner=owner, backups=backups)
+        _restore_capture_owner(d, m, src)
+        if changed:
+            n += 1
+    log(f"agent state: {n} written/needed")
+
+
 def step_system_files(m, dry, backups) -> None:
     for target, src in m.get("system_files", {}).items():
         d, s = Path(target), VPS_DATA / src
@@ -4008,8 +4156,9 @@ def op_install_cargo_deps(args) -> int:
     return install_project_deps(m, ("rust",), bool(getattr(args, "yes", False)))
 
 
-STEP_ORDER = ["hooks", "packages", "users", "binaries", "dotfiles", "system",
-              "firewall", "ssh", "services", "mise", "repos"]
+STEP_ORDER = ["hooks", "packages", "users", "binaries", "dotfiles",
+              "agent_state", "system", "firewall", "ssh", "services", "mise",
+              "repos"]
 
 
 def op_apply(args) -> int:
@@ -4042,6 +4191,7 @@ def op_apply(args) -> int:
     steps = {
         "hooks": step_hooks, "packages": step_packages, "users": step_users,
         "binaries": step_binaries, "dotfiles": step_dotfiles,
+        "agent_state": step_agent_state,
         "system": step_system_files, "firewall": step_firewall, "ssh": step_ssh,
         "services": step_services, "mise": step_mise, "repos": step_repos,
     }
@@ -4049,7 +4199,7 @@ def op_apply(args) -> int:
         for name in STEP_ORDER:
             if name in selected:
                 log(f"--- step: {name} ---")
-                if name in ("users", "dotfiles", "system", "ssh"):
+                if name in ("users", "dotfiles", "agent_state", "system", "ssh"):
                     steps[name](m, args.dry_run, backups)
                 else:
                     steps[name](m, args.dry_run)
